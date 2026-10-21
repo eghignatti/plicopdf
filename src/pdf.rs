@@ -1,10 +1,14 @@
 //! Motore PDF: `lopdf` per modificare il documento, `hayro` per disegnarlo. Tutto Rust puro.
 
 use std::path::Path;
+use std::rc::Rc;
 
 use hayro::hayro_interpret::InterpreterSettings;
 use hayro::hayro_syntax::Pdf;
-use hayro::vello_cpu::color::palette::css::WHITE;
+use hayro::hayro_syntax::page::Page;
+use hayro::vello_cpu::color::AlphaColor;
+use hayro::vello_cpu::color::Srgb;
+use hayro::vello_cpu::color::palette::css::{TRANSPARENT, WHITE};
 use hayro::{PixmapSettings, RenderCache, RenderSettings};
 use image::DynamicImage;
 pub use lopdf::ObjectId;
@@ -16,11 +20,31 @@ pub type Res<T> = Result<T, Box<dyn std::error::Error>>;
 const SIZE: f32 = 14.0;
 const LEAD: f32 = 18.0;
 const PAD: f32 = 9.0;
+/// Margine attorno al testo libero.
+const NOTE_PAD: f32 = 2.0;
 
-/// Cosa viene impresso sulla pagina: una firma/immagine o un timbro di testo.
+/// Cosa viene impresso sulla pagina: una firma/immagine, un timbro di testo o testo libero.
 pub enum Content {
     Image(DynamicImage),
     Text { lines: Vec<String>, color: [u8; 3] },
+    /// Testo libero, senza cornice; `size` è il corpo in punti.
+    Note { text: String, color: [u8; 3], size: f32 },
+}
+
+/// Oggetto posato su una pagina ma non ancora impresso: resta spostabile, ridimensionabile
+/// ed eliminabile fino al salvataggio.
+#[derive(Clone)]
+pub struct Placed {
+    /// La pagina come oggetto PDF: resta la stessa anche se le pagine vengono riordinate.
+    pub page: ObjectId,
+    /// Centro, in spazio utente della pagina (non ruotato).
+    pub x: f32,
+    pub y: f32,
+    /// Larghezza in punti.
+    pub width: f32,
+    /// Rotazione della pagina quando è stato posato: il contenuto era dritto rispetto ad allora.
+    pub rot: i64,
+    pub content: Rc<Content>,
 }
 
 impl Content {
@@ -31,6 +55,10 @@ impl Content {
             Content::Text { lines, .. } => {
                 let widest = lines.iter().map(|l| text_width(l, &BOLD, SIZE)).fold(0.0, f32::max);
                 (widest + 2.0 * PAD, lines.len() as f32 * LEAD + 2.0 * PAD)
+            }
+            Content::Note { text, size, .. } => {
+                let widest = text.split('\n').map(|l| text_width(l, &REGULAR, *size)).fold(0.0, f32::max);
+                (widest.max(*size) + 2.0 * NOTE_PAD, text.split('\n').count() as f32 * size * 1.2 + 2.0 * NOTE_PAD)
             }
         }
     }
@@ -158,6 +186,90 @@ fn draw_on_page(doc: &mut Document, id: ObjectId, kind: &str, items: Vec<(String
     page.set("Contents", contents);
     page.set("Resources", resources);
     Ok(())
+}
+
+/// Imprime `c` sulla pagina `page`, centrato in (x, y) di spazio utente e largo `width` punti,
+/// contro-ruotato di `rot` gradi perché appaia dritto sulla pagina ruotata.
+fn stamp(doc: &mut Document, page: ObjectId, x: f32, y: f32, width: f32, rot: i64, c: &Content) -> Res<()> {
+    let (w, h) = c.size();
+    let scale = width / w;
+    let (sin, cos) = (rot as f32).to_radians().sin_cos();
+    let (ma, mb, mc, md) = (scale * cos, scale * sin, -scale * sin, scale * cos);
+    let (me, mf) = (x - (ma * w + mc * h) / 2.0, y - (mb * w + md * h) / 2.0);
+
+    let name = format!("Pddf{}", doc.max_id + 1);
+    let (kind, resource, body) = match c {
+        Content::Image(img) => {
+            let rgba = img.to_rgba8();
+            let base = dictionary! {
+                "Type" => "XObject", "Subtype" => "Image", "BitsPerComponent" => 8,
+                "Width" => rgba.width() as i64, "Height" => rgba.height() as i64,
+            };
+            let stream = |doc: &mut Document, mut dict: Dictionary, space: &str, data: Vec<u8>| {
+                dict.set("ColorSpace", space);
+                let mut stream = Stream::new(dict, data);
+                let _ = stream.compress(); // se fallisce resta non compresso, comunque valido
+                doc.add_object(stream)
+            };
+            let mask = stream(doc, base.clone(), "DeviceGray", rgba.pixels().map(|p| p[3]).collect());
+            let mut dict = base;
+            dict.set("SMask", mask);
+            let rgb = rgba.pixels().flat_map(|p| [p[0], p[1], p[2]]).collect();
+            let image = stream(doc, dict, "DeviceRGB", rgb);
+            ("XObject", image, format!("{w:.3} 0 0 {h:.3} 0 0 cm /{name} Do"))
+        }
+        Content::Text { lines, color } => {
+            let font = doc.add_object(dictionary! {
+                "Type" => "Font", "Subtype" => "Type1",
+                "BaseFont" => "Helvetica-Bold", "Encoding" => "WinAnsiEncoding",
+            });
+            let [r, g, b] = color.map(|c| c as f32 / 255.0);
+            let mut body = format!(
+                "{r:.3} {g:.3} {b:.3} RG {r:.3} {g:.3} {b:.3} rg 2 w 1.5 1.5 {:.3} {:.3} re S BT /{name} {SIZE} Tf",
+                w - 3.0,
+                h - 3.0
+            );
+            for (k, line) in lines.iter().enumerate() {
+                // +4.5: la linea di base sta sopra il fondo della riga (spazio per i discendenti)
+                let (x, y) = ((w - text_width(line, &BOLD, SIZE)) / 2.0, h - PAD - (k as f32 + 1.0) * LEAD + 4.5);
+                body += &format!(" 1 0 0 1 {x:.3} {y:.3} Tm {} Tj", hex_string(line));
+            }
+            ("Font", font, body + " ET")
+        }
+        Content::Note { text, color, size } => {
+            let font = doc.add_object(dictionary! {
+                "Type" => "Font", "Subtype" => "Type1",
+                "BaseFont" => "Helvetica", "Encoding" => "WinAnsiEncoding",
+            });
+            let [r, g, b] = color.map(|c| c as f32 / 255.0);
+            let mut body = format!("{r:.3} {g:.3} {b:.3} rg BT /{name} {size:.2} Tf");
+            for (k, line) in text.split('\n').enumerate() {
+                // La linea di base sta un quarto di corpo sopra il fondo della riga.
+                let y = h - NOTE_PAD - (k as f32 + 1.0) * size * 1.2 + size * 0.25;
+                body += &format!(" 1 0 0 1 {NOTE_PAD:.3} {y:.3} Tm {} Tj", hex_string(line));
+            }
+            ("Font", font, body + " ET")
+        }
+    };
+
+    let ops = format!("q {ma:.5} {mb:.5} {mc:.5} {md:.5} {me:.3} {mf:.3} cm\n{body}\nQ");
+    draw_on_page(doc, page, kind, vec![(name, resource)], &ops)
+}
+
+/// Imprime gli oggetti posati; quelli su pagine non più presenti vengono scartati.
+fn stamp_all(doc: &mut Document, root: ObjectId, items: &[Placed]) -> Res<()> {
+    let kids = kids_of(doc, root)?;
+    for p in items.iter().filter(|p| kids.contains(&p.page)) {
+        stamp(doc, p.page, p.x, p.y, p.width, p.rot, &p.content)?;
+    }
+    Ok(())
+}
+
+fn render_page(page: &Page, width_px: i32, bg: AlphaColor<Srgb>) -> (usize, usize, Vec<u8>) {
+    let scale = width_px.max(1) as f32 / page.render_dimensions().0;
+    let settings = PixmapSettings { x_scale: scale, y_scale: scale, bg_color: bg };
+    let pm = hayro::render(page, &RenderCache::new(), &InterpreterSettings::default(), &RenderSettings::default(), &settings);
+    (pm.width() as usize, pm.height() as usize, pm.data_as_u8_slice().to_vec())
 }
 
 /// Aspetto visibile di un'annotazione: (stream, Rect, BBox, Matrix).
@@ -400,9 +512,11 @@ impl Doc {
         self.edit(|s| drop_pages(&mut s.doc, s.root, pages))
     }
 
-    /// Un nuovo PDF con le sole pagine indicate; il documento aperto non cambia.
-    pub fn extract(&self, pages: &[usize]) -> Res<Vec<u8>> {
+    /// Un nuovo PDF con le sole pagine indicate, con impressi gli oggetti posati su di esse;
+    /// il documento aperto non cambia.
+    pub fn extract(&self, pages: &[usize], items: &[Placed]) -> Res<Vec<u8>> {
         let mut doc = self.doc.clone();
+        stamp_all(&mut doc, self.root, items)?;
         let others: Vec<usize> = (0..self.len()).filter(|i| !pages.contains(i)).collect();
         drop_pages(&mut doc, self.root, &others)?;
         serialize(&mut doc)
@@ -459,79 +573,80 @@ impl Doc {
 
     /// Renderizza la pagina alla larghezza data: (larghezza, altezza, RGBA).
     pub fn render(&self, i: usize, width_px: i32) -> Res<(usize, usize, Vec<u8>)> {
-        let page = self.view.pages().get(i).ok_or("pagina inesistente")?;
-        let scale = width_px.max(1) as f32 / page.render_dimensions().0;
-        let settings = PixmapSettings { x_scale: scale, y_scale: scale, bg_color: WHITE };
-        let pm = hayro::render(page, &RenderCache::new(), &InterpreterSettings::default(), &RenderSettings::default(), &settings);
-        Ok((pm.width() as usize, pm.height() as usize, pm.data_as_u8_slice().to_vec()))
+        Ok(render_page(self.view.pages().get(i).ok_or("pagina inesistente")?, width_px, WHITE))
     }
 
-    /// Imprime `c` sulla pagina `i`, largo `width` punti e centrato in (u, v):
-    /// punti dall'angolo in alto a sinistra della pagina come appare a video.
-    pub fn place(&mut self, i: usize, u: f32, v: f32, width: f32, c: &Content) -> Res<()> {
-        let b = self.view.pages().get(i).ok_or("pagina inesistente")?.intersected_crop_box();
-        let (x0, y0, x1, y1) = (b.x0 as f32, b.y0 as f32, b.x1 as f32, b.y1 as f32);
-        self.edit(|s| {
-            let id = s.page_id(i)?;
-            // Da coordinate a video a spazio utente non ruotato; il contenuto va
-            // contro-ruotato perché appaia dritto.
-            let rot = s.rotation(id);
-            let (cx, cy) = match rot {
-                90 => (x0 + v, y0 + u),
-                180 => (x1 - u, y0 + v),
-                270 => (x1 - v, y1 - u),
-                _ => (x0 + u, y1 - v),
-            };
-            let (w, h) = c.size();
-            let scale = width / w;
-            let (sin, cos) = (rot as f32).to_radians().sin_cos();
-            let (ma, mb, mc, md) = (scale * cos, scale * sin, -scale * sin, scale * cos);
-            let (me, mf) = (cx - (ma * w + mc * h) / 2.0, cy - (mb * w + md * h) / 2.0);
+    /// Riquadro visibile [x0, y0, x1, y1] della pagina `i` e sua rotazione.
+    fn frame(&self, i: usize) -> Option<([f32; 4], i64)> {
+        let b = self.view.pages().get(i)?.intersected_crop_box();
+        Some(([b.x0 as f32, b.y0 as f32, b.x1 as f32, b.y1 as f32], self.rotation(self.page_id(i).ok()?)))
+    }
 
-            let name = format!("Pddf{}", s.doc.max_id + 1);
-            let (kind, resource, body) = match c {
-                Content::Image(img) => {
-                    let rgba = img.to_rgba8();
-                    let base = dictionary! {
-                        "Type" => "XObject", "Subtype" => "Image", "BitsPerComponent" => 8,
-                        "Width" => rgba.width() as i64, "Height" => rgba.height() as i64,
-                    };
-                    let stream = |doc: &mut Document, mut dict: Dictionary, space: &str, data: Vec<u8>| {
-                        dict.set("ColorSpace", space);
-                        let mut stream = Stream::new(dict, data);
-                        let _ = stream.compress(); // se fallisce resta non compresso, comunque valido
-                        doc.add_object(stream)
-                    };
-                    let mask = stream(&mut s.doc, base.clone(), "DeviceGray", rgba.pixels().map(|p| p[3]).collect());
-                    let mut dict = base;
-                    dict.set("SMask", mask);
-                    let rgb = rgba.pixels().flat_map(|p| [p[0], p[1], p[2]]).collect();
-                    let image = stream(&mut s.doc, dict, "DeviceRGB", rgb);
-                    ("XObject", image, format!("{w:.3} 0 0 {h:.3} 0 0 cm /{name} Do"))
-                }
-                Content::Text { lines, color } => {
-                    let font = s.doc.add_object(dictionary! {
-                        "Type" => "Font", "Subtype" => "Type1",
-                        "BaseFont" => "Helvetica-Bold", "Encoding" => "WinAnsiEncoding",
-                    });
-                    let [r, g, b] = color.map(|c| c as f32 / 255.0);
-                    let mut body = format!(
-                        "{r:.3} {g:.3} {b:.3} RG {r:.3} {g:.3} {b:.3} rg 2 w 1.5 1.5 {:.3} {:.3} re S BT /{name} {SIZE} Tf",
-                        w - 3.0,
-                        h - 3.0
-                    );
-                    for (k, line) in lines.iter().enumerate() {
-                        // +4.5: la linea di base sta sopra il fondo della riga (spazio per i discendenti)
-                        let (x, y) = ((w - text_width(line, &BOLD, SIZE)) / 2.0, h - PAD - (k as f32 + 1.0) * LEAD + 4.5);
-                        body += &format!(" 1 0 0 1 {x:.3} {y:.3} Tm {} Tj", hex_string(line));
-                    }
-                    ("Font", font, body + " ET")
-                }
-            };
-
-            let ops = format!("q {ma:.5} {mb:.5} {mc:.5} {md:.5} {me:.3} {mf:.3} cm\n{body}\nQ");
-            draw_on_page(&mut s.doc, id, kind, vec![(name, resource)], &ops)
+    /// Da coordinate a video (punti dall'angolo in alto a sinistra della pagina come appare)
+    /// allo spazio utente della pagina, non ruotato.
+    pub fn to_user(&self, i: usize, u: f32, v: f32) -> Option<(f32, f32)> {
+        let ([x0, y0, x1, y1], rot) = self.frame(i)?;
+        Some(match rot {
+            90 => (x0 + v, y0 + u),
+            180 => (x1 - u, y0 + v),
+            270 => (x1 - v, y1 - u),
+            _ => (x0 + u, y1 - v),
         })
+    }
+
+    /// L'inverso di `to_user`.
+    pub fn to_view(&self, i: usize, x: f32, y: f32) -> Option<(f32, f32)> {
+        let ([x0, y0, x1, y1], rot) = self.frame(i)?;
+        Some(match rot {
+            90 => (y - y0, x - x0),
+            180 => (x1 - x, y - y0),
+            270 => (y1 - y, x1 - x),
+            _ => (x - x0, y1 - y),
+        })
+    }
+
+    pub fn page_rotation(&self, i: usize) -> i64 {
+        self.frame(i).map_or(0, |f| f.1)
+    }
+
+    /// La pagina `i` come oggetto PDF, per agganciarle gli oggetti posati.
+    pub fn page_key(&self, i: usize) -> Option<ObjectId> {
+        self.page_id(i).ok()
+    }
+
+    /// Imprime subito `c` sulla pagina `i`, largo `width` punti e centrato in (u, v) a video.
+    #[cfg(test)]
+    pub fn place(&mut self, i: usize, u: f32, v: f32, width: f32, c: &Content) -> Res<()> {
+        let (x, y) = self.to_user(i, u, v).ok_or("pagina inesistente")?;
+        let rot = self.page_rotation(i);
+        let id = self.page_id(i)?;
+        self.edit(|s| stamp(&mut s.doc, id, x, y, width, rot, c))
+    }
+
+    /// Imprime gli oggetti posati, in un solo passo annullabile.
+    pub fn flatten(&mut self, items: &[Placed]) -> Res<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        self.edit(|s| stamp_all(&mut s.doc, s.root, items))
+    }
+
+    /// Anteprima su fondo trasparente (RGBA premoltiplicato), disegnata dal motore stesso:
+    /// a video il contenuto appare esattamente come verrà impresso.
+    pub fn preview(c: &Content, width_px: i32) -> Res<(usize, usize, Vec<u8>)> {
+        let (w, h) = c.size();
+        let mut d = Document::with_version("1.5");
+        let pages = d.new_object_id();
+        let page = d.add_object(dictionary! { "Type" => "Page", "Parent" => pages, "MediaBox" => vec![0.0.into(), 0.0.into(), w.into(), h.into()] });
+        d.objects.insert(pages, dictionary! { "Type" => "Pages", "Kids" => vec![Object::Reference(page)], "Count" => 1 }.into());
+        let catalog = d.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+        d.trailer.set("Root", catalog);
+        stamp(&mut d, page, w / 2.0, h / 2.0, w, 0, c)?;
+        let mut bytes = vec![];
+        d.save_to(&mut bytes)?;
+        let pdf = Pdf::new(bytes).map_err(|e| format!("anteprima non disponibile: {e:?}"))?;
+        let page = pdf.pages().first().ok_or("anteprima vuota")?;
+        Ok(render_page(page, width_px, TRANSPARENT))
     }
 
     /// Cerca una voce nel campo o, se manca, nei campi da cui eredita.
@@ -565,17 +680,8 @@ impl Doc {
 
     /// Campi compilabili della pagina `i` (esclusi quelli in sola lettura, nascosti o di firma).
     pub fn fields(&self, i: usize) -> Vec<Field> {
-        let (Ok(page), Some(view)) = (self.page_id(i), self.view.pages().get(i)) else { return vec![] };
-        let b = view.intersected_crop_box();
-        let (x0, y0, x1, y1) = (b.x0 as f32, b.y0 as f32, b.x1 as f32, b.y1 as f32);
-        let rot = self.rotation(page);
-        // Dallo spazio utente della pagina alle coordinate a video (l'inverso di `place`).
-        let to_screen = |x: f32, y: f32| match rot {
-            90 => (y - y0, x - x0),
-            180 => (x1 - x, y - y0),
-            270 => (y1 - y, x1 - x),
-            _ => (x - x0, y1 - y),
-        };
+        let Ok(page) = self.page_id(i) else { return vec![] };
+        let to_screen = |x: f32, y: f32| self.to_view(i, x, y).unwrap_or_default();
         let annots = match self.doc.get_dictionary(page).and_then(|d| d.get_deref(b"Annots", &self.doc)) {
             Ok(Object::Array(a)) => a,
             _ => return vec![],
@@ -807,7 +913,7 @@ mod tests {
     fn extract_and_replace() {
         let mut d = Doc::from_bytes(&sample()).unwrap();
         let out = std::env::temp_dir().join("pddf-test-estratte.pdf");
-        write(&out, &d.extract(&[0, 2]).unwrap()).unwrap();
+        write(&out, &d.extract(&[0, 2], &[]).unwrap()).unwrap();
         assert_eq!(widths(&Doc::open(&out).unwrap()), [100, 300]);
         assert_eq!(widths(&d), [100, 200, 300]);
 
@@ -818,6 +924,30 @@ mod tests {
         assert!(d.delete(&[0, 1, 2]).is_err());
         d.delete(&[0, 2]).unwrap();
         assert_eq!(widths(&d), [100]);
+        std::fs::remove_file(out).ok();
+    }
+
+    #[test]
+    fn placed_objects() {
+        let mut d = Doc::from_bytes(&sample()).unwrap();
+        let note = Rc::new(Content::Note { text: "Testo libero\nè qui".into(), color: [0, 0, 0], size: 12.0 });
+        let (w, h, px) = Doc::preview(&note, 200).unwrap();
+        assert!(px.chunks(4).any(|p| p[3] == 255) && px.chunks(4).any(|p| p[3] == 0), "anteprima {w}x{h} senza testo o senza trasparenza");
+
+        // Posato in alto a sinistra della pagina 2 (larga 200), poi la pagina viene ruotata e
+        // spostata: impresso al salvataggio, deve seguirla.
+        d.rotate(&[1], 1).unwrap();
+        let (u, v) = (60.0, 50.0);
+        let (x, y) = d.to_user(1, u, v).unwrap();
+        assert_eq!(d.to_view(1, x, y).unwrap(), (u, v));
+        let item = Placed { page: d.page_key(1).unwrap(), x, y, width: 60.0, rot: d.page_rotation(1), content: note };
+        d.move_page(1, 0).unwrap();
+        let out = std::env::temp_dir().join("pddf-test-oggetti.pdf");
+        write(&out, &d.extract(&[0], std::slice::from_ref(&item)).unwrap()).unwrap();
+        let e = Doc::open(&out).unwrap();
+        assert!(inked(&e, 0, 0.0, 0.0, 0.5, 0.5) && !inked(&e, 0, 0.5, 0.0, 1.0, 1.0) && !inked(&e, 0, 0.0, 0.5, 1.0, 1.0));
+        d.flatten(std::slice::from_ref(&item)).unwrap();
+        assert!(inked(&d, 0, 0.0, 0.0, 0.5, 0.5) && !inked(&d, 1, 0.0, 0.0, 1.0, 1.0));
         std::fs::remove_file(out).ok();
     }
 

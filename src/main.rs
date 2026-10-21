@@ -5,9 +5,11 @@ mod pdf;
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
-use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, vec2};
-use pdf::{Content, Doc, Field, FieldKind, ObjectId, Res};
+use eframe::egui::{self, Color32, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextureHandle, load::SizedTexture, vec2};
+use egui_phosphor::regular as ph;
+use pdf::{Content, Doc, Field, FieldKind, ObjectId, Placed, Res};
 
 const INK: [u8; 3] = [15, 25, 90];
 const ACCENT: Color32 = Color32::from_rgb(40, 110, 220);
@@ -22,6 +24,11 @@ struct Stamp {
 }
 
 fn config_dir() -> PathBuf {
+    // PDDF_CONFIG: cartella a parte, es. per le prove senza toccare firme e timbri veri.
+    if let Some(dir) = std::env::var_os("PDDF_CONFIG") {
+        std::fs::create_dir_all(&dir).ok();
+        return dir.into();
+    }
     // Windows: %APPDATA%; Linux (anche dentro Flatpak): $XDG_CONFIG_HOME o ~/.config
     let var = |k| std::env::var_os(k).map(PathBuf::from);
     let base = var("APPDATA").or_else(|| var("XDG_CONFIG_HOME")).or_else(|| var("HOME").map(|h| h.join(".config")));
@@ -168,6 +175,114 @@ struct StampEdit {
     import: Option<Import>,
 }
 
+/// Oggetto posato sulla pagina e non ancora impresso, con la sua anteprima a video.
+#[derive(Clone)]
+struct Overlay {
+    item: Placed,
+    tex: TextureHandle,
+    /// Altezza / larghezza del contenuto dritto.
+    aspect: f32,
+}
+
+/// Strumento attivo, in attesa del clic sulla pagina: un timbro dell'elenco o (None) il testo.
+struct Tool {
+    stamp: Option<usize>,
+    content: Rc<Content>,
+    tex: TextureHandle,
+    aspect: f32,
+    width: f32,
+}
+
+/// Un passo da annullare: se ha toccato il documento (la cui storia sta in `Doc`)
+/// e com'erano gli oggetti posati prima.
+struct Step {
+    doc: bool,
+    items: Vec<Overlay>,
+}
+
+fn push(history: &mut Vec<Step>, step: Step) {
+    if history.len() == 100 {
+        history.remove(0);
+    }
+    history.push(step);
+}
+
+/// Anteprima a video di ciò che verrà impresso.
+fn overlay_texture(ctx: &egui::Context, c: &Content) -> Res<TextureHandle> {
+    let img = match c {
+        Content::Image(img) => {
+            let img = img.to_rgba8();
+            egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], &img)
+        }
+        _ => {
+            let (w, h, px) = Doc::preview(c, 800)?;
+            egui::ColorImage::from_rgba_premultiplied([w, h], &px)
+        }
+    };
+    Ok(ctx.load_texture("oggetto", img, Default::default()))
+}
+
+fn aspect(c: &Content) -> f32 {
+    let (w, h) = c.size();
+    h / w
+}
+
+/// Larghezza iniziale in punti: le immagini 5 cm, i testi al loro corpo naturale.
+fn natural_width(c: &Content) -> f32 {
+    match c {
+        Content::Image(_) => 50.0 * 72.0 / 25.4,
+        _ => c.size().0,
+    }
+}
+
+impl Tool {
+    fn new(ctx: &egui::Context, stamp: Option<usize>, c: Content) -> Res<Self> {
+        Ok(Self { stamp, tex: overlay_texture(ctx, &c)?, aspect: aspect(&c), width: natural_width(&c), content: Rc::new(c) })
+    }
+}
+
+/// Pulsante a icona; la descrizione compare passandoci sopra, anche quando è disattivato.
+fn icon(ui: &mut egui::Ui, glyph: &str, tip: &str, enabled: bool) -> bool {
+    let b = egui::Button::new(RichText::new(glyph).size(18.0)).min_size(vec2(30.0, 28.0));
+    ui.add_enabled(enabled, b).on_hover_text(tip).on_disabled_hover_text(tip).clicked()
+}
+
+/// Come `icon`, ma resta evidenziato finché è attivo.
+fn toggle(ui: &mut egui::Ui, glyph: &str, tip: &str, on: bool, enabled: bool) -> bool {
+    let b = egui::Button::selectable(on, RichText::new(glyph).size(18.0)).min_size(vec2(30.0, 28.0));
+    ui.add_enabled(enabled, b).on_hover_text(tip).on_disabled_hover_text(tip).clicked()
+}
+
+/// Comando con icona e una parola sotto, per l'area Modifica.
+fn labeled(ui: &mut egui::Ui, glyph: &str, word: &str, tip: &str, on: bool, enabled: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(58.0, 48.0), if enabled { Sense::click() } else { Sense::hover() });
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, on, word));
+    let v = ui.visuals();
+    if on {
+        ui.painter().rect_filled(rect, 4.0, v.selection.bg_fill);
+    } else if enabled && resp.hovered() {
+        ui.painter().rect_filled(rect, 4.0, v.widgets.hovered.weak_bg_fill);
+    }
+    let color = if enabled { v.text_color() } else { v.weak_text_color() };
+    ui.painter().text(rect.center_top() + vec2(0.0, 17.0), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(20.0), color);
+    ui.painter().text(rect.center_bottom() - vec2(0.0, 10.0), egui::Align2::CENTER_CENTER, word, egui::FontId::proportional(11.0), color);
+    resp.on_hover_text(tip).clicked() && enabled
+}
+
+/// Area della barra, come i gruppi delle ribbon: i comandi in riga, il nome sotto.
+fn group(ui: &mut egui::Ui, name: &str, add: impl FnOnce(&mut egui::Ui)) -> Rect {
+    ui.vertical(|ui| {
+        let row = ui.horizontal(|ui| {
+            ui.set_min_height(48.0);
+            add(ui)
+        });
+        let (r, _) = ui.allocate_exact_size(vec2(row.response.rect.width(), 13.0), Sense::hover());
+        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, name, egui::FontId::proportional(11.0), ui.visuals().weak_text_color());
+    })
+    .response
+    .rect
+}
+
 enum Act {
     /// Le azioni sulle pagine valgono per la selezione o, se vuota, per la pagina corrente.
     Rotate(i32),
@@ -177,7 +292,9 @@ enum Act {
     Insert(PathBuf),
     Extract(PathBuf),
     Replace(PathBuf),
-    Tool(usize),
+    /// Attiva o disattiva un timbro dell'elenco, o (None) il testo libero.
+    Tool(Option<usize>),
+    /// Posa l'oggetto dello strumento attivo sulla pagina, nel punto a video (u, v).
     Place(usize, f32, f32),
     /// Nuovo valore per un campo del modulo.
     Field(ObjectId, String),
@@ -210,9 +327,21 @@ struct App {
     /// Pagine renderizzate: indice -> (larghezza in pixel, texture). Larghezza -1 = da rifare.
     view: HashMap<usize, (i32, TextureHandle)>,
     stamps: Vec<Stamp>,
-    /// Timbro attivo (indice, rapporto altezza/larghezza) in attesa del clic sulla pagina.
-    tool: Option<(usize, f32)>,
-    width_mm: f32,
+    /// Anteprime dell'elenco firme e timbri (None se il contenuto non si apre).
+    tiles: HashMap<usize, Option<TextureHandle>>,
+    /// Finestra di gestione di firme e timbri aperta.
+    manage: bool,
+    tool: Option<Tool>,
+    /// Firme, timbri e testi posati e non ancora impressi: lo diventano al salvataggio.
+    items: Vec<Overlay>,
+    /// Oggetto selezionato sulla pagina.
+    picked: Option<usize>,
+    /// Testo libero in modifica: oggetto, testo, colore, corpo.
+    note: Option<(usize, String, [u8; 3], f32)>,
+    history: Vec<Step>,
+    /// Larghezza dell'area Visualizza al fotogramma precedente, per centrarla.
+    bar_mid: f32,
+    bar_right: f32,
     /// Firma in corso di disegno: nome con cui salvarla e tratti.
     sig: Option<NewSig>,
     edit: Option<StampEdit>,
@@ -332,7 +461,7 @@ impl App {
             cur: 0,
             sel: BTreeSet::new(),
             zoom: 1.0,
-            fit: Fit::Width,
+            fit: Fit::Height,
             last_zoom: 0.0,
             zoomed_at: 0.0,
             offset: egui::Vec2::ZERO,
@@ -345,8 +474,15 @@ impl App {
             thumbs: HashMap::new(),
             view: HashMap::new(),
             stamps: load_stamps(),
+            tiles: HashMap::new(),
+            manage: false,
             tool: None,
-            width_mm: 50.0,
+            items: vec![],
+            picked: None,
+            note: None,
+            history: vec![],
+            bar_mid: 0.0,
+            bar_right: 0.0,
             sig: None,
             edit: None,
             msg: String::new(),
@@ -371,7 +507,16 @@ impl App {
     }
 
     fn dirty(&self) -> bool {
-        self.doc.as_ref().is_some_and(|d| d.dirty)
+        self.doc.as_ref().is_some_and(|d| d.dirty) || !self.items.is_empty()
+    }
+
+    fn stamps_changed(&mut self) {
+        save_stamps(&self.stamps);
+        self.tiles.clear();
+    }
+
+    fn placed(&self) -> Vec<Placed> {
+        self.items.iter().map(|o| o.item.clone()).collect()
     }
 
     fn open(&mut self, path: PathBuf) {
@@ -383,7 +528,8 @@ impl App {
             Ok(d) => {
                 (self.doc, self.path, self.cur, self.tool) = (Some(d), Some(path), 0, None);
                 self.sel.clear();
-                (self.fit, self.goto) = (Fit::Width, Some(0));
+                (self.items, self.picked, self.note, self.history) = (vec![], None, None, vec![]);
+                (self.fit, self.goto) = (Fit::Height, Some(0));
                 self.msg.clear();
                 self.editing = None;
                 self.refresh();
@@ -403,7 +549,19 @@ impl App {
                 None => return false,
             },
         };
-        match doc.save(&path) {
+        // Gli oggetti posati vengono impressi ora; "Annulla" li riporta modificabili.
+        let placed = self.items.iter().map(|o| o.item.clone()).collect::<Vec<_>>();
+        if let Err(e) = doc.flatten(&placed) {
+            self.msg = format!("Salvataggio fallito: {e}");
+            return false;
+        }
+        let result = doc.save(&path);
+        if !placed.is_empty() {
+            push(&mut self.history, Step { doc: true, items: std::mem::take(&mut self.items) });
+            (self.picked, self.note) = (None, None);
+            self.refresh();
+        }
+        match result {
             Ok(()) => {
                 self.msg = format!("Salvato {}", path.display());
                 self.path = Some(path);
@@ -444,27 +602,30 @@ impl App {
         if !proceed {
             return;
         }
-        self.doc = None; // scartato (o appena salvato): niente più modifiche in sospeso
+        // Scartato (o appena salvato): documento e oggetti posati, niente più modifiche in sospeso.
+        (self.doc, self.items) = (None, vec![]);
         match pending {
             Some(Pending::Open(p)) => self.open(p),
             _ => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
     }
 
-    fn apply(&mut self, act: Act) {
-        let (file, cur, pages) = (self.file_name(), self.cur, self.targets());
+    fn apply(&mut self, ctx: &egui::Context, act: Act) {
+        let (file, cur, pages, placed) = (self.file_name(), self.cur, self.targets(), self.placed());
         let Some(d) = &mut self.doc else { return };
-        let wpt = self.width_mm * 72.0 / 25.4;
-        let (is_tool, is_place) = (matches!(act, Act::Tool(_) | Act::Extract(_)), matches!(act, Act::Place(..) | Act::Field(..)));
+        let structural = matches!(act, Act::Rotate(_) | Act::Move(..) | Act::Delete | Act::Insert(_) | Act::Replace(_));
+        let edits_doc = structural || matches!(act, Act::Field(..));
         if matches!(act, Act::Move(..) | Act::Delete | Act::Undo | Act::Insert(_) | Act::Replace(_)) {
             self.sel.clear(); // gli indici selezionati non indicano più le stesse pagine
         }
+        let (before, is_undo) = (self.items.clone(), matches!(act, Act::Undo));
+        let mut undone_doc = false;
         let mut done = String::new();
         let result: Res<()> = (|| {
             match act {
                 Act::Rotate(q) => {
                     d.rotate(&pages, q)?;
-                    // La vista va sulla pagina ruotata: "Larghezza" si adatta alla pagina corrente.
+                    // La vista va sulla pagina ruotata: l'adattamento segue la pagina corrente.
                     self.cur = pages[0];
                 }
                 Act::Move(from, to) => {
@@ -473,181 +634,314 @@ impl App {
                 }
                 Act::Delete => d.delete(&pages)?,
                 Act::Undo => {
-                    d.undo()?;
+                    if let Some(step) = self.history.pop() {
+                        if step.doc {
+                            d.undo()?;
+                            undone_doc = true;
+                        }
+                        (self.items, self.picked, self.note) = (step.items, None, None);
+                    }
                 }
                 Act::Insert(p) => d.insert_pdf(&p, cur + 1)?,
                 Act::Extract(p) => {
-                    pdf::write(&p, &d.extract(&pages)?)?;
-                    done = format!("{} pagine estratte in {}", pages.len(), p.display());
+                    pdf::write(&p, &d.extract(&pages, &placed)?)?;
+                    let what = if pages.len() == 1 { "1 pagina estratta".into() } else { format!("{} pagine estratte", pages.len()) };
+                    done = format!("{what} in {}", p.display());
                 }
                 Act::Replace(p) => {
                     d.replace(&pages, &p)?;
                     self.cur = pages[0];
                 }
-                Act::Tool(i) => {
-                    self.tool = match self.tool {
-                        Some((j, _)) if j == i => None,
+                Act::Tool(stamp) => {
+                    self.tool = match &self.tool {
+                        Some(t) if t.stamp == stamp => None,
                         _ => {
-                            let (w, h) = content(&self.stamps[i], &file, cur + 1, d.len())?.size();
-                            Some((i, h / w))
+                            let c = match stamp {
+                                Some(i) => content(&self.stamps[i], &file, cur + 1, d.len())?,
+                                None => Content::Note { text: "Testo".into(), color: [0, 0, 0], size: 12.0 },
+                            };
+                            Some(Tool::new(ctx, stamp, c)?)
                         }
-                    }
+                    };
+                    self.picked = None;
                 }
                 Act::Field(id, value) => d.set_field(id, &value)?,
                 Act::Place(page, u, v) => {
-                    if let Some((i, _)) = self.tool.take() {
-                        d.place(page, u, v, wpt, &content(&self.stamps[i], &file, page + 1, d.len())?)?;
+                    if let Some(t) = self.tool.take() {
+                        let (x, y) = d.to_user(page, u, v).ok_or("pagina inesistente")?;
+                        // I segnaposto ({pagina}, {data}...) valgono per la pagina e il momento in cui si posa.
+                        let (content, tex) = match t.stamp {
+                            Some(i) if !self.stamps[i].text.starts_with("img:") => {
+                                let c = content(&self.stamps[i], &file, page + 1, d.len())?;
+                                let tex = overlay_texture(ctx, &c)?;
+                                (Rc::new(c), tex)
+                            }
+                            _ => (t.content, t.tex),
+                        };
+                        let item = Placed { page: d.page_key(page).ok_or("pagina inesistente")?, x, y, width: t.width, rot: d.page_rotation(page), content };
+                        self.items.push(Overlay { item, tex, aspect: t.aspect });
+                        self.picked = Some(self.items.len() - 1);
+                        if let Content::Note { text, color, size } = &*self.items[self.items.len() - 1].item.content {
+                            self.note = Some((self.items.len() - 1, text.clone(), *color, *size));
+                        }
                     }
                 }
             }
             Ok(())
         })();
         self.cur = self.cur.min(d.len().saturating_sub(1));
+        if result.is_ok() && (edits_doc || (!is_undo && self.items.len() != before.len())) {
+            push(&mut self.history, Step { doc: edits_doc, items: before });
+        }
         self.msg = result.err().map_or(done, |e| e.to_string());
-        if !is_tool {
+        if edits_doc || undone_doc {
             self.refresh();
         }
-        if !is_tool && !is_place {
+        if structural || undone_doc {
             self.goto = Some(self.cur); // la struttura è cambiata: resta sulla pagina corrente
         }
     }
 
+    /// Barra a tre aree, come una ribbon: File a sinistra, Visualizza al centro, Modifica a destra.
     fn toolbar(&mut self, ui: &mut egui::Ui) -> Option<Act> {
         let mut act = None;
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Apri…").clicked()
-                && let Some(p) = pdf_dialog(&self.path).pick_file()
-            {
-                self.open(p);
-            }
-            let Some(n) = self.doc.as_ref().map(Doc::len) else { return };
-            if ui.button("Salva").clicked() {
-                self.save(false);
-            }
-            if ui.button("Salva con nome…").clicked() {
-                self.save(true);
-            }
-            if ui.button("Inserisci PDF…").on_hover_text("Inserisce un altro PDF dopo la pagina corrente").clicked()
-                && let Some(p) = pdf_dialog(&self.path).pick_file()
-            {
-                act = Some(Act::Insert(p));
-            }
-            ui.separator();
-            let k = self.targets().len();
-            let hint = "Vale per la pagina corrente o per quelle selezionate (Ctrl/Maiusc + clic sulle miniature, Ctrl+A tutte)";
-            if ui.button("Ruota ↺").on_hover_text(hint).clicked() {
-                act = Some(Act::Rotate(-1));
-            }
-            if ui.button("Ruota ↻").on_hover_text(hint).clicked() {
-                act = Some(Act::Rotate(1));
-            }
-            if ui.add_enabled(self.cur > 0, egui::Button::new("Sposta su")).clicked() {
-                act = Some(Act::Move(self.cur, self.cur - 1));
-            }
-            if ui.add_enabled(self.cur + 1 < n, egui::Button::new("Sposta giù")).clicked() {
-                act = Some(Act::Move(self.cur, self.cur + 1));
-            }
-            if ui.add_enabled(k < n, egui::Button::new("Elimina")).on_hover_text(hint).clicked() {
-                act = Some(Act::Delete);
-            }
-            let stem = self.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            if ui.button("Estrai…").on_hover_text("Salva in un nuovo PDF la pagina corrente o quelle selezionate").clicked()
-                && let Some(p) = pdf_dialog(&self.path).set_file_name(format!("{stem}-estratto.pdf")).save_file()
-            {
-                act = Some(Act::Extract(p));
-            }
-            if ui.button("Sostituisci…").on_hover_text("Sostituisce la pagina corrente o quelle selezionate con un altro PDF").clicked()
-                && let Some(p) = pdf_dialog(&self.path).pick_file()
-            {
-                act = Some(Act::Replace(p));
-            }
-            if ui.button("Annulla").on_hover_text("Ctrl+Z").clicked() {
-                act = Some(Act::Undo);
-            }
-            ui.separator();
-            let mut percent = self.zoom * 100.0;
-            if ui.button("−").on_hover_text("Ctrl −  oppure Ctrl + rotella").clicked() {
-                percent /= 1.25;
-            }
-            ui.add(egui::DragValue::new(&mut percent).range(10.0..=640.0).fixed_decimals(0).suffix("%"));
-            if ui.button("+").on_hover_text("Ctrl +  oppure Ctrl + rotella").clicked() {
-                percent *= 1.25;
-            }
-            if ui.button("100%").clicked() {
-                percent = 100.0;
-            }
-            if percent != self.zoom * 100.0 {
-                (self.zoom, self.fit) = (percent / 100.0, Fit::Free);
-            }
-            for (fit, text) in [(Fit::Width, "Larghezza"), (Fit::Height, "Altezza")] {
-                if ui.selectable_label(self.fit == fit, text).on_hover_text("Adatta la pagina alla finestra").clicked() {
-                    self.fit = if self.fit == fit { Fit::Free } else { fit };
-                    self.goto = Some(self.cur); // riallinea la pagina corrente in cima alla vista
+        let n = self.doc.as_ref().map_or(0, Doc::len);
+        let has = n > 0;
+        // Finestra stretta (es. 1024 px): anche Modifica passa alle sole icone, per starci tutta.
+        let compact = ui.available_width() < 1100.0;
+        let labeled = |ui: &mut egui::Ui, glyph: &str, word: &str, tip: &str, on: bool, enabled: bool| {
+            if compact { toggle(ui, glyph, &format!("{word}: {tip}"), on, enabled) } else { labeled(ui, glyph, word, tip, on, enabled) }
+        };
+        ui.horizontal(|ui| {
+            group(ui, "File", |ui| {
+                if icon(ui, ph::FOLDER_OPEN, "Apri (Ctrl+O)", true)
+                    && let Some(p) = pdf_dialog(&self.path).pick_file()
+                {
+                    self.open(p);
                 }
-            }
+                if icon(ui, ph::FLOPPY_DISK, "Salva (Ctrl+S): firme, timbri e testi posati vengono impressi nel PDF", has) {
+                    self.save(false);
+                }
+                if icon(ui, ph::FLOPPY_DISK_BACK, "Salva con nome…", has) {
+                    self.save(true);
+                }
+            });
             ui.separator();
-            ui.horizontal(|ui| {
-                ui.label("Pagina");
+            // Visualizza al centro dello spazio libero, Modifica in fondo a destra: si usano le
+            // larghezze delle due aree al fotogramma precedente.
+            let slack = 4.0 * ui.spacing().item_spacing.x + 8.0;
+            let free = (ui.available_width() - self.bar_mid - self.bar_right - slack).max(0.0);
+            ui.add_space(free / 2.0);
+            let mid = group(ui, "Visualizza", |ui| {
+                let mut percent = self.zoom * 100.0;
+                if icon(ui, ph::MAGNIFYING_GLASS_MINUS, "Riduci (Ctrl −  oppure Ctrl + rotella)", has) {
+                    percent /= 1.25;
+                }
+                let field = egui::DragValue::new(&mut percent).range(10.0..=640.0).fixed_decimals(0).suffix("%");
+                ui.add_enabled(has, field).on_hover_text("Zoom: trascina, oppure clicca e scrivi il valore");
+                if icon(ui, ph::MAGNIFYING_GLASS_PLUS, "Ingrandisci (Ctrl +  oppure Ctrl + rotella)", has) {
+                    percent *= 1.25;
+                }
+                if percent != self.zoom * 100.0 {
+                    (self.zoom, self.fit) = (percent / 100.0, Fit::Free);
+                }
+                for (fit, glyph, tip) in [(Fit::Width, ph::ARROWS_OUT_LINE_HORIZONTAL, "Adatta alla larghezza"), (Fit::Height, ph::ARROWS_OUT_LINE_VERTICAL, "Adatta all'altezza")] {
+                    if toggle(ui, glyph, tip, self.fit == fit, has) {
+                        self.fit = if self.fit == fit { Fit::Free } else { fit };
+                        self.goto = Some(self.cur); // riallinea la pagina corrente in cima alla vista
+                    }
+                }
                 let mut page = self.cur + 1;
-                let field = egui::DragValue::new(&mut page).range(1..=n).speed(0.05).update_while_editing(false).suffix(format!(" / {n}"));
-                if ui.add(field).on_hover_text("Clicca, scrivi il numero e premi Invio").changed() {
+                let field = egui::DragValue::new(&mut page).range(1..=n.max(1)).speed(0.05).update_while_editing(false).suffix(format!(" / {n}"));
+                if ui.add_enabled(has, field).on_hover_text("Pagina: clicca, scrivi il numero e premi Invio").changed() {
                     (self.cur, self.goto, self.follow) = (page - 1, Some(page - 1), true);
                 }
             });
-
+            self.bar_mid = mid.width();
+            ui.add_space(free / 2.0);
+            ui.separator();
+            let right = group(ui, "Modifica", |ui| {
+                let text_on = self.tool.as_ref().is_some_and(|t| t.stamp.is_none());
+                if labeled(ui, ph::TEXT_T, "Testo", "Aggiungi testo: poi clicca sulla pagina", text_on, has) {
+                    act = Some(Act::Tool(None));
+                }
+                ui.separator();
+                let k = self.targets().len();
+                let which = "la pagina corrente, o quelle selezionate con Ctrl/Maiusc + clic sulle miniature (Ctrl+A tutte)";
+                if labeled(ui, ph::ARROW_COUNTER_CLOCKWISE, "Antiorario", &format!("Ruota in senso antiorario {which}"), false, has) {
+                    act = Some(Act::Rotate(-1));
+                }
+                if labeled(ui, ph::ARROW_CLOCKWISE, "Orario", &format!("Ruota in senso orario {which}"), false, has) {
+                    act = Some(Act::Rotate(1));
+                }
+                if labeled(ui, ph::ARROW_UP, "Su", "Sposta su la pagina corrente", false, has && self.cur > 0) {
+                    act = Some(Act::Move(self.cur, self.cur - 1));
+                }
+                if labeled(ui, ph::ARROW_DOWN, "Giù", "Sposta giù la pagina corrente", false, self.cur + 1 < n) {
+                    act = Some(Act::Move(self.cur, self.cur + 1));
+                }
+                if labeled(ui, ph::TRASH, "Elimina", &format!("Elimina {which}"), false, has && k < n) {
+                    act = Some(Act::Delete);
+                }
+                ui.separator();
+                if labeled(ui, ph::FILE_PLUS, "Inserisci", "Inserisci un altro PDF dopo la pagina corrente", false, has)
+                    && let Some(p) = pdf_dialog(&self.path).pick_file()
+                {
+                    act = Some(Act::Insert(p));
+                }
+                let stem = self.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                if labeled(ui, ph::EXPORT, "Estrai", "Estrai in un nuovo PDF la pagina corrente o quelle selezionate", false, has)
+                    && let Some(p) = pdf_dialog(&self.path).set_file_name(format!("{stem}-estratto.pdf")).save_file()
+                {
+                    act = Some(Act::Extract(p));
+                }
+                if labeled(ui, ph::SWAP, "Sostituisci", "Sostituisci la pagina corrente o quelle selezionate con un altro PDF", false, has)
+                    && let Some(p) = pdf_dialog(&self.path).pick_file()
+                {
+                    act = Some(Act::Replace(p));
+                }
+                ui.separator();
+                if labeled(ui, ph::ARROW_U_UP_LEFT, "Annulla", "Annulla l'ultima modifica (Ctrl+Z)", false, !self.history.is_empty()) {
+                    act = Some(Act::Undo);
+                }
+            });
+            self.bar_right = right.width();
         });
         act
     }
 
+    /// Anteprima di una voce dell'elenco, creata la prima volta che serve.
+    fn tile(&mut self, ctx: &egui::Context, i: usize) -> Option<TextureHandle> {
+        if !self.tiles.contains_key(&i) {
+            let n = self.doc.as_ref().map_or(1, Doc::len);
+            let tex = content(&self.stamps[i], &self.file_name(), self.cur + 1, n).ok().and_then(|c| overlay_texture(ctx, &c).ok());
+            self.tiles.insert(i, tex);
+        }
+        self.tiles[&i].clone()
+    }
+
+    /// Elenco sempre a vista: un clic sceglie la firma o il timbro da posare.
+    /// Aggiunte, modifiche ed eliminazioni stanno nella finestra di gestione.
     fn stamps_panel(&mut self, ui: &mut egui::Ui) -> Option<Act> {
         let mut act = None;
-        let mut remove = None;
         ui.add_space(4.0);
-        ui.strong("Firme e timbri");
-        ui.add_space(4.0);
-        // Pulsanti in alto: con molte firme salvate l'elenco non li spinge fuori dalla finestra.
-        let full = ui.available_width();
-        let wide = |text| egui::Button::new(text).min_size(vec2(full, 0.0));
-        if ui.add(wide("Aggiungi firma…")).on_hover_text("Disegnala col mouse o ricavala da una foto o scansione").clicked() {
-            self.sig = Some(NewSig { name: "Firma".into(), from_image: false, strokes: vec![], import: None });
-        }
-        if ui.add(wide("Nuovo timbro…")).clicked() {
-            let stamp = Stamp { name: "Nuovo timbro".into(), color: [190, 20, 20], text: "TESTO\n{data}".into() };
-            self.edit = Some(StampEdit { index: None, stamp, from_image: false, import: None });
-        }
-        ui.add(egui::Slider::new(&mut self.width_mm, 10.0..=180.0).suffix(" mm").text("larghezza"));
+        ui.horizontal(|ui| {
+            ui.strong("Firme e timbri");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icon(ui, ph::GEAR, "Gestisci firme e timbri: aggiungi, modifica, elimina", true) {
+                    self.manage = true;
+                }
+            });
+        });
         ui.separator();
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            for (i, s) in self.stamps.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    let active = self.tool.is_some_and(|(j, _)| j == i);
-                    let label = ui.add_enabled(self.doc.is_some(), egui::Button::selectable(active, &s.name));
-                    if label.on_hover_text("Seleziona, poi clicca sulla pagina").clicked() {
-                        act = Some(Act::Tool(i));
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("elimina").clicked() {
-                            remove = Some(i);
-                        }
-                        if ui.small_button("modifica").clicked() {
+            if self.stamps.is_empty() {
+                ui.weak(format!("Nessuna firma o timbro: aggiungili con {} in alto.", ph::GEAR));
+            }
+            for i in 0..self.stamps.len() {
+                let tex = self.tile(ui.ctx(), i);
+                let active = self.tool.as_ref().is_some_and(|t| t.stamp == Some(i));
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 76.0), Sense::click());
+                let p = ui.painter_at(rect);
+                let v = ui.visuals();
+                let bg = if active { ACCENT.gamma_multiply(0.5) } else if resp.hovered() { v.widgets.hovered.bg_fill } else { v.widgets.inactive.bg_fill };
+                p.rect_filled(rect.shrink(2.0), 6.0, bg);
+                // Cartoncino bianco: l'inchiostro scuro resta leggibile anche col tema scuro.
+                let card = Rect::from_min_max(rect.min + vec2(8.0, 8.0), Pos2::new(rect.max.x - 8.0, rect.max.y - 24.0));
+                p.rect_filled(card, 4.0, Color32::WHITE);
+                if let Some(t) = tex {
+                    let size = t.size_vec2();
+                    let fit = size * ((card.width() - 8.0) / size.x).min((card.height() - 6.0) / size.y);
+                    p.image(t.id(), Rect::from_center_size(card.center(), fit), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                }
+                let name = &self.stamps[i].name;
+                p.text(Pos2::new(rect.center().x, rect.max.y - 13.0), egui::Align2::CENTER_CENTER, name, egui::FontId::proportional(13.0), v.text_color());
+                let tip = if self.doc.is_some() { format!("{name}: clicca, poi clicca sulla pagina per posarlo") } else { format!("{name}: apri un PDF per usarlo") };
+                if resp.on_hover_text(tip).clicked() && self.doc.is_some() {
+                    act = Some(Act::Tool(Some(i)));
+                }
+            }
+        });
+        act
+    }
+
+    fn manage_window(&mut self, ctx: &egui::Context) {
+        if !self.manage {
+            return;
+        }
+        let (mut open, mut remove) = (true, None);
+        egui::Window::new("Firme e timbri").open(&mut open).collapsible(false).resizable(false).pivot(egui::Align2::CENTER_TOP).default_pos(window_top(ctx)).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button(format!("{} Aggiungi firma…", ph::SIGNATURE)).on_hover_text("Disegnala col mouse o ricavala da una foto o scansione").clicked() {
+                    self.sig = Some(NewSig { name: "Firma".into(), from_image: false, strokes: vec![], import: None });
+                }
+                if ui.button(format!("{} Nuovo timbro…", ph::SEAL)).on_hover_text("Timbro di testo, anche con data e ora, oppure da immagine").clicked() {
+                    let stamp = Stamp { name: "Nuovo timbro".into(), color: [190, 20, 20], text: "TESTO\n{data}".into() };
+                    self.edit = Some(StampEdit { index: None, stamp, from_image: false, import: None });
+                }
+            });
+            ui.separator();
+            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                for (i, s) in self.stamps.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let glyph = if s.text.starts_with("img:") { ph::IMAGE } else { ph::TEXT_T };
+                        ui.add_sized(vec2(300.0, 24.0), egui::Label::new(format!("{glyph}  {}", s.name)).truncate());
+                        if icon(ui, ph::PENCIL_SIMPLE, "Modifica", true) {
                             self.edit = Some(StampEdit { index: Some(i), stamp: s.clone(), from_image: false, import: None });
                         }
+                        if icon(ui, ph::TRASH, "Elimina", true) {
+                            remove = Some(i);
+                        }
                     });
-                });
-            }
+                }
+            });
         });
         if let Some(i) = remove {
             self.stamps.remove(i);
             self.tool = None;
-            save_stamps(&self.stamps);
+            self.stamps_changed();
         }
-        act
+        if !open {
+            self.manage = false;
+        }
+    }
+
+    /// Testo libero selezionato: testo, corpo e colore, applicati man mano.
+    fn note_window(&mut self, ctx: &egui::Context) {
+        let Some((k, text, color, size)) = &mut self.note else { return };
+        let (mut open, mut changed, mut done) = (true, false, false);
+        egui::Window::new("Testo").open(&mut open).collapsible(false).resizable(false).pivot(egui::Align2::CENTER_TOP).default_pos(window_top(ctx)).show(ctx, |ui| {
+            let edit = ui.add(egui::TextEdit::multiline(text).desired_rows(3).desired_width(320.0));
+            if !edit.has_focus() && ui.memory(|m| m.focused().is_none()) {
+                edit.request_focus();
+            }
+            changed |= edit.changed();
+            ui.horizontal(|ui| {
+                changed |= ui.add(egui::DragValue::new(size).range(6.0..=72.0).suffix(" pt")).on_hover_text("Corpo del testo").changed();
+                changed |= ui.color_edit_button_srgb(color).on_hover_text("Colore").changed();
+                ui.weak("Solo alfabeto latino");
+            });
+            done = ui.button("Fatto").clicked();
+        });
+        if changed && let Some(o) = self.items.get_mut(*k) {
+            let c = Content::Note { text: text.clone(), color: *color, size: *size };
+            // La larghezza segue il testo, mantenendo l'ingrandimento scelto sulla pagina.
+            let scale = o.item.width / o.item.content.size().0;
+            if let Ok(tex) = overlay_texture(ctx, &c) {
+                (o.item.width, o.aspect, o.tex) = (c.size().0 * scale, aspect(&c), tex);
+                o.item.content = Rc::new(c);
+            }
+        }
+        if done || !open {
+            self.note = None;
+        }
     }
 
     fn signature_window(&mut self, ctx: &egui::Context) {
         let Some(sig) = &mut self.sig else { return };
         let (mut open, mut done) = (true, false);
-        egui::Window::new("Aggiungi firma").open(&mut open).collapsible(false).resizable(false).pivot(egui::Align2::CENTER_TOP).default_pos(window_top(ctx)).show(ctx, |ui| {
+        // In primo piano: si apre anche dalla finestra di gestione e deve stare sopra.
+        egui::Window::new("Aggiungi firma").order(egui::Order::Foreground).open(&mut open).collapsible(false).resizable(false).pivot(egui::Align2::CENTER_TOP).default_pos(window_top(ctx)).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Nome");
                 ui.text_edit_singleline(&mut sig.name);
@@ -693,7 +987,7 @@ impl App {
             match saved {
                 Ok(dest) => {
                     self.stamps.push(Stamp { name: sig.name.trim().to_string(), color: INK, text: format!("img:{}", dest.display()) });
-                    save_stamps(&self.stamps);
+                    self.stamps_changed();
                 }
                 Err(e) => self.msg = format!("Salvataggio firma fallito: {e}"),
             }
@@ -706,7 +1000,12 @@ impl App {
     fn editor_window(&mut self, ctx: &egui::Context) {
         let Some(ed) = &mut self.edit else { return };
         let (mut open, mut done) = (true, false);
-        egui::Window::new("Timbro").open(&mut open).collapsible(false).resizable(false).pivot(egui::Align2::CENTER_TOP).default_pos(window_top(ctx)).show(ctx, |ui| {
+        let title = match (&ed.index, ed.stamp.text.starts_with("img:")) {
+            (None, _) => "Nuovo timbro",
+            (Some(_), true) => "Modifica immagine",
+            (Some(_), false) => "Modifica timbro",
+        };
+        egui::Window::new(title).id(egui::Id::new("timbro")).order(egui::Order::Foreground).open(&mut open).collapsible(false).resizable(false).pivot(egui::Align2::CENTER_TOP).default_pos(window_top(ctx)).show(ctx, |ui| {
             let s = &mut ed.stamp;
             ui.horizontal(|ui| {
                 ui.label("Nome");
@@ -751,7 +1050,7 @@ impl App {
                 None => self.stamps.push(ed.stamp.clone()),
             }
             self.tool = None;
-            save_stamps(&self.stamps);
+            self.stamps_changed();
         }
         if done || !open {
             self.edit = None;
@@ -824,6 +1123,12 @@ impl App {
         act
     }
 
+    fn remove_item(&mut self, k: usize) {
+        push(&mut self.history, Step { doc: false, items: self.items.clone() });
+        self.items.remove(k);
+        (self.picked, self.note) = (None, None);
+    }
+
     /// Vista continua: tutte le pagine in colonna, si disegnano solo quelle visibili.
     fn page_view(&mut self, ui: &mut egui::Ui) -> Option<Act> {
         const GAP: f32 = 12.0;
@@ -880,7 +1185,8 @@ impl App {
         // Mentre lo zoom sta cambiando si riusa l'immagine esistente, stirata: si ridisegna a fine gesto.
         let settled = now - self.zoomed_at > 0.2;
 
-        let (tool, wpt, ppp) = (self.tool, self.width_mm * 72.0 / 25.4, ui.pixels_per_point());
+        let (placing, ppp) = (self.tool.is_some(), ui.pixels_per_point());
+        let mut remove = None;
         let mut act = None;
         let mut budget = 1; // al massimo un rendering per fotogramma, per non bloccare lo scorrimento
         let mut most_visible = (0.0, self.cur);
@@ -921,7 +1227,7 @@ impl App {
                 let resp = ui.interact(rect, ui.id().with(("pagina", i)), Sense::click());
                 // Moduli: i campi si compilano direttamente sulla pagina (non mentre si posiziona un timbro).
                 let fields = self.forms.entry(i).or_insert_with(|| doc.fields(i));
-                for (k, f) in fields.iter().enumerate().filter(|_| tool.is_none()) {
+                for (k, f) in fields.iter().enumerate().filter(|_| !placing) {
                     let at = |x: f32, y: f32| rect.min + vec2(x, y) * zoom;
                     let area = Rect::from_min_max(at(f.rect[0], f.rect[1]), at(f.rect[2], f.rect[3]));
                     let id = ui.id().with(("campo", i, k));
@@ -975,11 +1281,77 @@ impl App {
                         _ => {}
                     }
                 }
-                if let (Some((_, aspect)), Some(pos)) = (tool, resp.hover_pos()) {
+                if resp.clicked() && !placing {
+                    self.picked = None;
+                }
+
+                // Oggetti posati e non ancora impressi: sopra i campi, quindi ricevono loro i clic.
+                let (key, page_rot) = (doc.page_key(i), doc.page_rotation(i));
+                for k in 0..self.items.len() {
+                    let o = &self.items[k];
+                    if Some(o.item.page) != key {
+                        continue;
+                    }
+                    let Some((u, v)) = doc.to_view(i, o.item.x, o.item.y) else { continue };
+                    // La pagina può essere stata ruotata dopo la posa: l'oggetto ruota con lei.
+                    let turn = (page_rot - o.item.rot).rem_euclid(360);
+                    let upright = vec2(o.item.width, o.item.width * o.aspect) * zoom;
+                    let center = rect.min + vec2(u, v) * zoom;
+                    let bbox = Rect::from_center_size(center, if turn % 180 == 0 { upright } else { vec2(upright.y, upright.x) });
+                    let tex = SizedTexture::new(o.tex.id(), upright);
+                    egui::Image::new(tex).rotate((turn as f32).to_radians(), vec2(0.5, 0.5)).paint_at(ui, Rect::from_center_size(center, upright));
+                    if placing {
+                        continue;
+                    }
+                    let id = ui.id().with(("oggetto", k));
+                    let grab = ui.interact(bbox, id, Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::Move);
+                    if grab.clicked() || grab.drag_started() {
+                        self.picked = Some(k);
+                    }
+                    if grab.drag_started() {
+                        push(&mut self.history, Step { doc: false, items: self.items.clone() });
+                    }
+                    if grab.dragged() {
+                        let d = grab.drag_delta() / zoom;
+                        if let Some((x, y)) = doc.to_user(i, u + d.x, v + d.y) {
+                            (self.items[k].item.x, self.items[k].item.y) = (x, y);
+                        }
+                    }
+                    if grab.double_clicked()
+                        && let Content::Note { text, color, size } = &*self.items[k].item.content
+                    {
+                        push(&mut self.history, Step { doc: false, items: self.items.clone() });
+                        self.note = Some((k, text.clone(), *color, *size));
+                    }
+                    if self.picked != Some(k) {
+                        continue;
+                    }
+                    painter.rect_stroke(bbox, 0.0, Stroke::new(1.5, ACCENT), StrokeKind::Outside);
+                    // Maniglia nell'angolo: ridimensiona tenendo fermo il centro e le proporzioni.
+                    let handle = Rect::from_center_size(bbox.max, vec2(12.0, 12.0));
+                    painter.rect_filled(handle, 2.0, ACCENT);
+                    let resize = ui.interact(handle, id.with("dimensione"), Sense::drag()).on_hover_cursor(egui::CursorIcon::ResizeNwSe);
+                    if resize.drag_started() {
+                        push(&mut self.history, Step { doc: false, items: self.items.clone() });
+                    }
+                    if resize.dragged() {
+                        let d = resize.drag_delta();
+                        let grow = ((bbox.width() + 2.0 * d.x) / bbox.width() + (bbox.height() + 2.0 * d.y) / bbox.height()) / 2.0;
+                        let item = &mut self.items[k].item;
+                        item.width = (item.width * grow).max(8.0);
+                    }
+                    let bin = Rect::from_center_size(Pos2::new(bbox.max.x, bbox.min.y), vec2(22.0, 22.0));
+                    if ui.put(bin, egui::Button::new(RichText::new(ph::TRASH).size(13.0))).on_hover_text("Elimina (Canc)").clicked() {
+                        remove = Some(k);
+                    }
+                }
+
+                if let (Some(t), Some(pos)) = (&self.tool, resp.hover_pos()) {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-                    let ghost = Rect::from_center_size(pos, vec2(wpt, wpt * aspect) * zoom);
-                    painter.rect_filled(ghost, 2.0, ACCENT.gamma_multiply(0.12));
-                    painter.rect_stroke(ghost, 2.0, Stroke::new(1.5, ACCENT), StrokeKind::Inside);
+                    let size = vec2(t.width, t.width * t.aspect) * zoom;
+                    let ghost = Rect::from_center_size(pos, size);
+                    egui::Image::new(SizedTexture::new(t.tex.id(), size)).tint(Color32::from_white_alpha(170)).paint_at(ui, ghost);
+                    painter.rect_stroke(ghost, 2.0, Stroke::new(1.0, ACCENT), StrokeKind::Outside);
                     if resp.clicked() {
                         let at = (pos - rect.min) / zoom;
                         act = Some(Act::Place(i, at.x, at.y));
@@ -994,6 +1366,9 @@ impl App {
                 }
             }
         });
+        if let Some(k) = remove {
+            self.remove_item(k);
+        }
         self.view.retain(|i, _| (seen.0.saturating_sub(2)..=seen.1.saturating_add(2)).contains(i));
         self.forms.retain(|i, _| (seen.0..=seen.1).contains(i));
 
@@ -1051,8 +1426,13 @@ impl eframe::App for App {
                 (self.cur, self.goto, self.follow) = (page, Some(page), true);
             }
             if key(egui::Key::Escape) {
-                self.tool = None;
+                (self.tool, self.picked) = (None, None);
                 self.sel.clear();
+            }
+            if (key(egui::Key::Delete) || key(egui::Key::Backspace))
+                && let Some(k) = self.picked
+            {
+                self.remove_item(k);
             }
         }
 
@@ -1062,28 +1442,31 @@ impl eframe::App for App {
             ui.add_space(4.0);
         });
         egui::Panel::bottom("stato").show(ui, |ui| {
-            let hint = match (self.tool, self.sel.len()) {
-                (Some(_), _) => "Clicca sulla pagina per posizionare (Esc per annullare)".into(),
-                (None, 0) => String::new(),
-                (None, k) => format!("{k} pagine selezionate (Esc per deselezionare)"),
+            let hint = match (&self.tool, self.picked, self.sel.len()) {
+                (Some(_), _, _) => "Clicca sulla pagina per posare (Esc per annullare)".into(),
+                (None, Some(_), _) => "Trascina per spostare, angolo blu per ridimensionare, Canc per eliminare, doppio clic sul testo per modificarlo".into(),
+                (None, None, 0) => String::new(),
+                (None, None, k) => format!("{k} pagine selezionate (Esc per deselezionare)"),
             };
             ui.label(if self.msg.is_empty() { &hint } else { &self.msg });
         });
         egui::Panel::left("pagine").default_size(180.0).show(ui, |ui| {
             act = self.thumbnails(ui).or(act.take());
         });
-        egui::Panel::right("timbri").default_size(250.0).show(ui, |ui| {
+        egui::Panel::right("timbri").default_size(220.0).show(ui, |ui| {
             act = self.stamps_panel(ui).or(act.take());
         });
         egui::CentralPanel::default().show(ui, |ui| {
             act = self.page_view(ui).or(act.take());
         });
+        self.manage_window(&ctx);
+        self.note_window(&ctx);
         self.signature_window(&ctx);
         self.editor_window(&ctx);
         self.confirm_window(&ctx);
 
         if let Some(a) = act {
-            self.apply(a);
+            self.apply(&ctx, a);
         }
 
         let dirty = if self.dirty() { "*" } else { "" };
@@ -1107,6 +1490,9 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             // Ctrl +/− ingrandisce la pagina, non l'intera interfaccia.
             cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+            let mut fonts = egui::FontDefinitions::default();
+            egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+            cc.egui_ctx.set_fonts(fonts);
             let mut app = App::new();
             if let Some(p) = arg {
                 app.open(p);
