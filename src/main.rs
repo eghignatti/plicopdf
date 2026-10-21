@@ -160,6 +160,14 @@ struct Import {
     result: Option<(image::RgbaImage, TextureHandle)>,
 }
 
+/// Finestra "Timbro": nuovo (di testo o da immagine) oppure in modifica (`index`).
+struct StampEdit {
+    index: Option<usize>,
+    stamp: Stamp,
+    from_image: bool,
+    import: Option<Import>,
+}
+
 enum Act {
     /// Le azioni sulle pagine valgono per la selezione o, se vuota, per la pagina corrente.
     Rotate(i32),
@@ -207,10 +215,98 @@ struct App {
     width_mm: f32,
     /// Firma in corso di disegno: nome con cui salvarla e tratti.
     sig: Option<NewSig>,
-    edit: Option<(Option<usize>, Stamp)>,
+    edit: Option<StampEdit>,
     msg: String,
     title: String,
     confirm: Option<Pending>,
+}
+
+/// Finestre di firme e timbri: ancorate in alto, così cambiando scheda non saltano.
+fn window_top(ctx: &egui::Context) -> Pos2 {
+    ctx.content_rect().center() - vec2(0.0, 220.0)
+}
+
+/// Salva un PNG nella cartella di configurazione: firme e timbri non dipendono dal file originale.
+fn save_png(img: &image::RgbaImage) -> Result<PathBuf, String> {
+    let dest = config_dir().join(format!("img-{}.png", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+    img.save(&dest).map(|_| dest).map_err(|e| e.to_string())
+}
+
+/// Salva l'immagine importata: il solo tratto estratto, o una copia del file se l'estrazione è spenta.
+fn save_import(imp: &Import) -> Result<PathBuf, String> {
+    match &imp.result {
+        Some((img, _)) if imp.extract => save_png(img),
+        _ => {
+            let ext = imp.src.extension().and_then(|e| e.to_str()).unwrap_or("png");
+            let dest = config_dir().join(format!("img-{}.{ext}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+            std::fs::copy(&imp.src, &dest).map(|_| dest).map_err(|e| e.to_string())
+        }
+    }
+}
+
+/// Scheda "Da immagine", comune a firme e timbri: scelta del file, estrazione del tratto,
+/// anteprima. Restituisce true quando c'è un'immagine pronta da salvare.
+fn image_tab(ui: &mut egui::Ui, import: &mut Option<Import>, msg: &mut String, empty: &str) -> bool {
+    let pick = ui.button(if import.is_some() { "Cambia immagine…" } else { "Scegli immagine…" });
+    if pick.clicked()
+        && let Some(src) = rfd::FileDialog::new().add_filter("Immagini", &["png", "jpg", "jpeg"]).pick_file()
+    {
+        match load_image(&src) {
+            Ok(img) => {
+                let scan = ink::Scan::new(&img);
+                let (threshold, color) = (scan.auto, scan.ink_color(scan.auto));
+                *import = Some(Import { src, img, scan, extract: true, threshold, color, result: None });
+            }
+            Err(e) => *msg = format!("Immagine non leggibile: {e}"),
+        }
+    }
+    if let Some(imp) = import.as_mut() {
+        let mut changed = ui.checkbox(&mut imp.extract, "Estrai il tratto (toglie lo sfondo della carta)").changed();
+        ui.add_enabled_ui(imp.extract, |ui| {
+            ui.horizontal(|ui| {
+                let slider = egui::Slider::new(&mut imp.threshold, 0.05..=0.8).show_value(false).text("pulizia");
+                changed |= ui.add(slider).on_hover_text("Più a destra: sfondo più pulito, tratto più sottile").changed();
+                if ui.small_button("auto").clicked() {
+                    imp.threshold = imp.scan.auto;
+                    changed = true;
+                }
+                ui.separator();
+                ui.label("Colore");
+                changed |= ui.color_edit_button_srgb(&mut imp.color).changed();
+                for (text, c) in [("nero", [0, 0, 0]), ("blu", [15, 35, 130]), ("rosso", [190, 20, 20])] {
+                    if ui.small_button(text).clicked() {
+                        (imp.color, changed) = (c, true);
+                    }
+                }
+            });
+        });
+        if changed {
+            imp.result = None;
+        }
+        if imp.result.is_none() {
+            let img = if imp.extract { imp.scan.extract(imp.threshold, imp.color) } else { Some(imp.img.to_rgba8()) };
+            imp.result = img.map(|img| {
+                let shown = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], &img);
+                let tex = ui.ctx().load_texture("importa", shown, Default::default());
+                (img, tex)
+            });
+        }
+    }
+    // Fondo grigio chiaro: si vede subito se la carta è stata tolta.
+    let (rect, _) = ui.allocate_exact_size(vec2(520.0, 200.0), Sense::hover());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 4.0, Color32::from_gray(225));
+    let note = |text: &str| p.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(14.0), Color32::DARK_GRAY);
+    match import {
+        Some(Import { result: Some((_, t)), .. }) => {
+            let size = t.size_vec2();
+            let fit = Rect::from_center_size(rect.center(), size * ((rect.width() - 16.0) / size.x).min((rect.height() - 16.0) / size.y).min(1.0));
+            p.image(t.id(), fit, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        }
+        Some(_) => _ = note("Nessun tratto: abbassa la pulizia"),
+        None => _ = note(empty),
+    }
+    import.as_ref().is_some_and(|i| i.result.is_some())
 }
 
 /// Dialogo per i PDF, aperto nella cartella del documento corrente.
@@ -516,7 +612,8 @@ impl App {
             self.sig = Some(NewSig { name: "Firma".into(), from_image: false, strokes: vec![], import: None });
         }
         if ui.add(wide("Nuovo timbro…")).clicked() {
-            self.edit = Some((None, Stamp { name: "Nuovo timbro".into(), color: [190, 20, 20], text: "TESTO\n{data}".into() }));
+            let stamp = Stamp { name: "Nuovo timbro".into(), color: [190, 20, 20], text: "TESTO\n{data}".into() };
+            self.edit = Some(StampEdit { index: None, stamp, from_image: false, import: None });
         }
         ui.add(egui::Slider::new(&mut self.width_mm, 10.0..=180.0).suffix(" mm").text("larghezza"));
         ui.separator();
@@ -533,7 +630,7 @@ impl App {
                             remove = Some(i);
                         }
                         if ui.small_button("modifica").clicked() {
-                            self.edit = Some((Some(i), s.clone()));
+                            self.edit = Some(StampEdit { index: Some(i), stamp: s.clone(), from_image: false, import: None });
                         }
                     });
                 });
@@ -550,9 +647,7 @@ impl App {
     fn signature_window(&mut self, ctx: &egui::Context) {
         let Some(sig) = &mut self.sig else { return };
         let (mut open, mut done) = (true, false);
-        // Ancorata in alto: cambiando scheda l'altezza cambia e la finestra non deve saltare.
-        let top = ctx.content_rect().center() - vec2(0.0, 220.0);
-        egui::Window::new("Aggiungi firma").open(&mut open).collapsible(false).resizable(false).pivot(egui::Align2::CENTER_TOP).default_pos(top).show(ctx, |ui| {
+        egui::Window::new("Aggiungi firma").open(&mut open).collapsible(false).resizable(false).pivot(egui::Align2::CENTER_TOP).default_pos(window_top(ctx)).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Nome");
                 ui.text_edit_singleline(&mut sig.name);
@@ -563,66 +658,7 @@ impl App {
             });
             ui.separator();
             let ready = if sig.from_image {
-                let pick = ui.button(if sig.import.is_some() { "Cambia immagine…" } else { "Scegli immagine…" });
-                if pick.clicked()
-                    && let Some(src) = rfd::FileDialog::new().add_filter("Immagini", &["png", "jpg", "jpeg"]).pick_file()
-                {
-                    match load_image(&src) {
-                        Ok(img) => {
-                            let scan = ink::Scan::new(&img);
-                            let (threshold, color) = (scan.auto, scan.ink_color(scan.auto));
-                            sig.import = Some(Import { src, img, scan, extract: true, threshold, color, result: None });
-                        }
-                        Err(e) => self.msg = format!("Immagine non leggibile: {e}"),
-                    }
-                }
-                if let Some(imp) = &mut sig.import {
-                    let mut changed = ui.checkbox(&mut imp.extract, "Estrai il tratto (toglie lo sfondo della carta)").changed();
-                    ui.add_enabled_ui(imp.extract, |ui| {
-                        ui.horizontal(|ui| {
-                            let slider = egui::Slider::new(&mut imp.threshold, 0.05..=0.8).show_value(false).text("pulizia");
-                            changed |= ui.add(slider).on_hover_text("Più a destra: sfondo più pulito, tratto più sottile").changed();
-                            if ui.small_button("auto").clicked() {
-                                imp.threshold = imp.scan.auto;
-                                changed = true;
-                            }
-                            ui.separator();
-                            ui.label("Colore");
-                            changed |= ui.color_edit_button_srgb(&mut imp.color).changed();
-                            for (text, c) in [("nero", [0, 0, 0]), ("blu", [15, 35, 130])] {
-                                if ui.small_button(text).clicked() {
-                                    (imp.color, changed) = (c, true);
-                                }
-                            }
-                        });
-                    });
-                    if changed {
-                        imp.result = None;
-                    }
-                    if imp.result.is_none() {
-                        let img = if imp.extract { imp.scan.extract(imp.threshold, imp.color) } else { Some(imp.img.to_rgba8()) };
-                        imp.result = img.map(|img| {
-                            let shown = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], &img);
-                            let tex = ui.ctx().load_texture("importa", shown, Default::default());
-                            (img, tex)
-                        });
-                    }
-                }
-                // Fondo grigio chiaro: si vede subito se la carta è stata tolta.
-                let (rect, _) = ui.allocate_exact_size(vec2(520.0, 200.0), Sense::hover());
-                let p = ui.painter_at(rect);
-                p.rect_filled(rect, 4.0, Color32::from_gray(225));
-                let note = |text| p.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(14.0), Color32::DARK_GRAY);
-                match &sig.import {
-                    Some(Import { result: Some((_, t)), .. }) => {
-                        let size = t.size_vec2();
-                        let fit = Rect::from_center_size(rect.center(), size * ((rect.width() - 16.0) / size.x).min((rect.height() - 16.0) / size.y).min(1.0));
-                        p.image(t.id(), fit, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-                    }
-                    Some(_) => _ = note("Nessun tratto: abbassa la pulizia"),
-                    None => _ = note("Scegli una foto o una scansione della firma (PNG o JPG)"),
-                }
-                sig.import.as_ref().is_some_and(|i| i.result.is_some())
+                image_tab(ui, &mut sig.import, &mut self.msg, "Scegli una foto o una scansione della firma (PNG o JPG)")
             } else {
                 let strokes = &mut sig.strokes;
                 let (rect, resp) = ui.allocate_exact_size(vec2(520.0, 200.0), Sense::drag());
@@ -650,20 +686,9 @@ impl App {
             });
         });
         if done {
-            // Copia nella cartella di configurazione: la firma non dipende più dal file scelto.
-            let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-            let png = |img: &image::RgbaImage| {
-                let dest = config_dir().join(format!("firma-{stamp}.png"));
-                img.save(&dest).map(|_| dest).map_err(|e| e.to_string())
-            };
             let saved = match &sig.import {
-                Some(imp) if sig.from_image && !imp.extract => {
-                    let ext = imp.src.extension().and_then(|e| e.to_str()).unwrap_or("png");
-                    let dest = config_dir().join(format!("img-{stamp}.{ext}"));
-                    std::fs::copy(&imp.src, &dest).map(|_| dest).map_err(|e| e.to_string())
-                }
-                Some(Import { result: Some((img, _)), .. }) if sig.from_image => png(img),
-                _ => rasterize(&sig.strokes).ok_or_else(|| "firma vuota".to_string()).and_then(|img| png(&img)),
+                Some(imp) if sig.from_image => save_import(imp),
+                _ => rasterize(&sig.strokes).ok_or_else(|| "firma vuota".to_string()).and_then(|img| save_png(&img)),
             };
             match saved {
                 Ok(dest) => {
@@ -679,15 +704,27 @@ impl App {
     }
 
     fn editor_window(&mut self, ctx: &egui::Context) {
-        let Some((index, s)) = &mut self.edit else { return };
+        let Some(ed) = &mut self.edit else { return };
         let (mut open, mut done) = (true, false);
-        egui::Window::new("Timbro").open(&mut open).collapsible(false).resizable(false).pivot(egui::Align2::CENTER_CENTER).default_pos(ctx.content_rect().center()).show(ctx, |ui| {
+        egui::Window::new("Timbro").open(&mut open).collapsible(false).resizable(false).pivot(egui::Align2::CENTER_TOP).default_pos(window_top(ctx)).show(ctx, |ui| {
+            let s = &mut ed.stamp;
             ui.horizontal(|ui| {
                 ui.label("Nome");
                 ui.text_edit_singleline(&mut s.name);
             });
-            if s.text.starts_with("img:") {
+            // Un timbro nuovo può nascere da testo o da un'immagine; uno esistente resta com'è.
+            if ed.index.is_none() {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut ed.from_image, false, "Testo");
+                    ui.selectable_value(&mut ed.from_image, true, "Da immagine").on_hover_text("Scansione di un timbro a inchiostro, oppure un logo");
+                });
+                ui.separator();
+            }
+            let ready = if ed.from_image {
+                image_tab(ui, &mut ed.import, &mut self.msg, "Scegli l'immagine del timbro (PNG o JPG)")
+            } else if s.text.starts_with("img:") {
                 ui.label("Timbro grafico (immagine).");
+                true
             } else {
                 ui.text_edit_multiline(&mut s.text);
                 ui.horizontal(|ui| {
@@ -695,13 +732,23 @@ impl App {
                     ui.color_edit_button_srgb(&mut s.color);
                 });
                 ui.weak("Campi dinamici: {data} {ora} {utente} {file} {pagina} {pagine}");
-            }
-            done = ui.add_enabled(!s.text.trim().is_empty() && !s.name.trim().is_empty(), egui::Button::new("Salva")).clicked();
+                !s.text.trim().is_empty()
+            };
+            done = ui.add_enabled(ready && !s.name.trim().is_empty(), egui::Button::new("Salva")).clicked();
         });
+        if done && let Some(imp) = ed.import.as_ref().filter(|_| ed.from_image) {
+            match save_import(imp) {
+                Ok(dest) => ed.stamp.text = format!("img:{}", dest.display()),
+                Err(e) => {
+                    self.msg = format!("Salvataggio timbro fallito: {e}");
+                    done = false;
+                }
+            }
+        }
         if done {
-            match *index {
-                Some(i) => self.stamps[i] = s.clone(),
-                None => self.stamps.push(s.clone()),
+            match ed.index {
+                Some(i) => self.stamps[i] = ed.stamp.clone(),
+                None => self.stamps.push(ed.stamp.clone()),
             }
             self.tool = None;
             save_stamps(&self.stamps);
