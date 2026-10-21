@@ -1,0 +1,22 @@
+[package]
+name = "pddf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4.45"
+# glow (OpenGL) e non wgpu: avvio più rapido, eseguibile più piccolo, gira anche su GPU datate.
+eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
+hayro = "0.8.0"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+lopdf = "0.45.0"
+rfd = "0.17.2"
+
+# Il rendering PDF avviene su CPU: senza ottimizzazioni le build di sviluppo sono inutilizzabili.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
