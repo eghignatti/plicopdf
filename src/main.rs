@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextureHandle, load::SizedTexture, vec2};
 use egui_phosphor::regular as ph;
-use pdf::{Content, Doc, Field, FieldKind, ObjectId, Placed, Res};
+use pdf::{Align, Content, Doc, Field, FieldKind, Line, ObjectId, Placed, Res};
 
 const INK: [u8; 3] = [15, 25, 90];
 const ACCENT: Color32 = Color32::from_rgb(40, 110, 220);
@@ -91,7 +91,60 @@ fn content(s: &Stamp, file: &str, page: usize, pages: usize) -> Res<Content> {
         .replace("{file}", file)
         .replace("{pagina}", &page.to_string())
         .replace("{pagine}", &pages.to_string());
-    Ok(Content::Text { lines: text.lines().map(String::from).collect(), color: s.color })
+    Ok(Content::Text { lines: text.lines().map(Line::parse).collect(), color: s.color })
+}
+
+/// Riporta la formattazione delle righe dopo una modifica del testo: le righe prima e dopo il
+/// punto modificato tengono la loro, quelle nuove prendono quella della riga in cui si scriveva.
+fn remap(old: &str, new: &str, lines: &[Line]) -> Vec<Line> {
+    let (o, n): (Vec<char>, Vec<char>) = (old.chars().collect(), new.chars().collect());
+    let mut pre = o.iter().zip(&n).take_while(|(a, b)| a == b).count();
+    let mut suf = o.iter().rev().zip(n.iter().rev()).take(o.len().min(n.len()) - pre).take_while(|(a, b)| a == b).count();
+    // Solo inserimento o solo cancellazione: il punto è ambiguo (a capo in fondo a una riga o
+    // all'inizio della seguente), si sceglie il più a sinistra, come fa un elaboratore di testi.
+    let (short, long) = if o.len() < n.len() { (&o, &n) } else { (&n, &o) };
+    if pre + suf == short.len() {
+        let d = long.len() - short.len();
+        while pre > 0 && d > 0 && long[pre - 1] == long[pre + d - 1] {
+            pre -= 1;
+        }
+        suf = short.len() - pre;
+    }
+    let breaks = |c: &[char]| c.iter().filter(|&&c| c == '\n').count();
+    let (head, tail) = (breaks(&o[..pre]), breaks(&o[o.len() - suf..]));
+    let count = new.split('\n').count();
+    new.split('\n')
+        .enumerate()
+        .map(|(k, text)| {
+            let src = if k < head { k } else if k >= count - tail { lines.len().saturating_sub(count - k) } else { head };
+            let mut l = lines.get(src).or(lines.last()).cloned().unwrap_or_else(|| Line::parse(""));
+            l.text = text.into();
+            l
+        })
+        .collect()
+}
+
+/// Impaginazione a video del testo del timbro, con la formattazione di ogni riga.
+/// `bold_only`: solo le righe in grassetto, per ripassarle; le altre restano trasparenti.
+fn stamp_job(fonts: &mut egui::epaint::text::FontsView, lines: &[Line], width: f32, ink: Color32, bold_only: bool) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    for (k, l) in lines.iter().enumerate() {
+        let font = egui::FontId::proportional(l.size);
+        let w = fonts.layout_no_wrap(l.text.clone(), font.clone(), ink).size().x;
+        let lead = match l.align {
+            Align::Left => 0.0,
+            Align::Center => (width - w) / 2.0,
+            Align::Right => width - w,
+        };
+        let color = if bold_only && !l.bold { Color32::TRANSPARENT } else { ink };
+        let underline = if l.underline && !bold_only { Stroke::new((l.size / 14.0).max(1.0), ink) } else { Stroke::NONE };
+        let format = egui::TextFormat { font_id: font, color, italics: l.italic, underline, ..Default::default() };
+        job.append(&l.text, lead.max(0.0), format.clone());
+        if k + 1 < lines.len() {
+            job.append("\n", 0.0, format);
+        }
+    }
+    job
 }
 
 /// Trasforma i tratti disegnati in un PNG trasparente ritagliato sulla firma.
@@ -173,6 +226,24 @@ struct StampEdit {
     stamp: Stamp,
     from_image: bool,
     import: Option<Import>,
+    /// Il testo del timbro nel campo unico; `lines` ne tiene la formattazione, una per riga.
+    text: String,
+    lines: Vec<Line>,
+    /// Prima e ultima riga del cursore o della selezione: lì si applica la formattazione.
+    cur: (usize, usize),
+    /// Dopo un clic su un pulsante della barra il cursore torna nel campo, al fotogramma dopo:
+    /// in quello del clic egui toglie il fuoco a chi non è stato cliccato.
+    refocus: bool,
+    /// Anteprima del timbro e il testo (con il colore) da cui è stata fatta.
+    preview: Option<(String, TextureHandle)>,
+}
+
+impl StampEdit {
+    fn new(index: Option<usize>, stamp: Stamp) -> Self {
+        let lines: Vec<Line> = stamp.text.split('\n').map(Line::parse).collect();
+        let text = lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+        Self { index, stamp, from_image: false, import: None, text, lines, cur: (0, 0), refocus: false, preview: None }
+    }
 }
 
 /// Oggetto posato sulla pagina e non ancora impresso, con la sua anteprima a video.
@@ -263,7 +334,7 @@ fn labeled(ui: &mut egui::Ui, glyph: &str, word: &str, tip: &str, on: bool, enab
     } else if enabled && resp.hovered() {
         ui.painter().rect_filled(rect, 4.0, v.widgets.hovered.weak_bg_fill);
     }
-    let color = if enabled { v.text_color() } else { v.weak_text_color() };
+    let color = if enabled { v.text_color() } else { v.text_color().gamma_multiply(v.disabled_alpha) };
     ui.painter().text(rect.center_top() + vec2(0.0, 17.0), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(20.0), color);
     ui.painter().text(rect.center_bottom() - vec2(0.0, 10.0), egui::Align2::CENTER_CENTER, word, egui::FontId::proportional(11.0), color);
     resp.on_hover_text(tip).clicked() && enabled
@@ -877,7 +948,7 @@ impl App {
                 }
                 if ui.button(format!("{} Nuovo timbro…", ph::SEAL)).on_hover_text("Timbro di testo, anche con data e ora, oppure da immagine").clicked() {
                     let stamp = Stamp { name: "Nuovo timbro".into(), color: [190, 20, 20], text: "TESTO\n{data}".into() };
-                    self.edit = Some(StampEdit { index: None, stamp, from_image: false, import: None });
+                    self.edit = Some(StampEdit::new(None, stamp));
                 }
             });
             ui.separator();
@@ -887,7 +958,7 @@ impl App {
                         let glyph = if s.text.starts_with("img:") { ph::IMAGE } else { ph::TEXT_T };
                         ui.add_sized(vec2(300.0, 24.0), egui::Label::new(format!("{glyph}  {}", s.name)).truncate());
                         if icon(ui, ph::PENCIL_SIMPLE, "Modifica", true) {
-                            self.edit = Some(StampEdit { index: Some(i), stamp: s.clone(), from_image: false, import: None });
+                            self.edit = Some(StampEdit::new(Some(i), s.clone()));
                         }
                         if icon(ui, ph::TRASH, "Elimina", true) {
                             remove = Some(i);
@@ -1025,13 +1096,93 @@ impl App {
                 ui.label("Timbro grafico (immagine).");
                 true
             } else {
-                ui.text_edit_multiline(&mut s.text);
+                // Barra di formattazione: mostra quella della riga del cursore e la applica
+                // a tutte le righe selezionate, come in un elaboratore di testi.
+                let id = egui::Id::new("testo timbro");
+                if std::mem::take(&mut ed.refocus) {
+                    ui.memory_mut(|m| m.request_focus(id));
+                }
+                let (a, b) = (ed.cur.0.min(ed.lines.len() - 1), ed.cur.1.min(ed.lines.len() - 1));
+                let was = ed.lines[a].clone();
+                let mut f = was.clone();
                 ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut f.size).range(4.0..=96.0).fixed_decimals(0).suffix(" pt")).on_hover_text("Dimensione del carattere");
+                    for (on, glyph, tip) in [(&mut f.bold, ph::TEXT_B, "Grassetto"), (&mut f.italic, ph::TEXT_ITALIC, "Corsivo"), (&mut f.underline, ph::TEXT_UNDERLINE, "Sottolineato")] {
+                        if toggle(ui, glyph, tip, *on, true) {
+                            (*on, ed.refocus) = (!*on, true);
+                        }
+                    }
+                    ui.separator();
+                    for (al, glyph, tip) in [(Align::Left, ph::TEXT_ALIGN_LEFT, "A sinistra"), (Align::Center, ph::TEXT_ALIGN_CENTER, "Al centro"), (Align::Right, ph::TEXT_ALIGN_RIGHT, "A destra")] {
+                        if toggle(ui, glyph, tip, f.align == al, true) {
+                            (f.align, ed.refocus) = (al, true);
+                        }
+                    }
+                    ui.separator();
                     ui.label("Colore");
                     ui.color_edit_button_srgb(&mut s.color);
                 });
+                if f != was {
+                    for l in &mut ed.lines[a..=b] {
+                        (f.size != was.size).then(|| l.size = f.size);
+                        (f.bold != was.bold).then(|| l.bold = f.bold);
+                        (f.italic != was.italic).then(|| l.italic = f.italic);
+                        (f.underline != was.underline).then(|| l.underline = f.underline);
+                        (f.align != was.align).then(|| l.align = f.align);
+                    }
+                }
+                // Il campo: foglio bianco, inchiostro del colore del timbro.
+                let ink = Color32::from_rgb(s.color[0], s.color[1], s.color[2]);
+                let (old, lines) = (ed.text.clone(), &ed.lines);
+                let wide = std::cell::Cell::new(0.0); // larghezza usata dal campo, per ripassare il grassetto
+                let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, width: f32| {
+                    wide.set(width);
+                    ui.fonts_mut(|fonts| {
+                        let job = stamp_job(fonts, &remap(&old, buf.as_str(), lines), width, ink, false);
+                        fonts.layout_job(job)
+                    })
+                };
+                let out = ui
+                    .scope(|ui| {
+                        ui.visuals_mut().text_cursor.stroke.color = Color32::BLACK;
+                        egui::TextEdit::multiline(&mut ed.text).id(id).desired_width(440.0).desired_rows(4).background_color(Color32::WHITE).layouter(&mut layouter).show(ui)
+                    })
+                    .inner;
+                if ed.text != old {
+                    ed.text.retain(|c| c != '\r');
+                    ed.lines = remap(&old, &ed.text, &ed.lines);
+                }
+                // Il grassetto: le righe in grassetto vengono ripassate spostate di poco.
+                if ed.lines.iter().any(|l| l.bold) {
+                    let bold = ui.fonts_mut(|fonts| {
+                        let job = stamp_job(fonts, &ed.lines, wide.get(), ink, true);
+                        fonts.layout_job(job)
+                    });
+                    for dx in [0.5, 1.0] {
+                        ui.painter().galley(out.galley_pos + vec2(dx, 0.0), bold.clone(), ink);
+                    }
+                }
+                // Righe del cursore solo mentre si scrive: un clic sulla barra non deve cambiarle.
+                if let Some(r) = out.cursor_range.filter(|_| ui.memory(|m| m.has_focus(id))) {
+                    let r = r.as_sorted_char_range();
+                    let line = |i: usize| ed.text.chars().take(i).filter(|&c| c == '\n').count();
+                    ed.cur = (line(r.start.0), line(r.end.0));
+                }
                 ui.weak("Campi dinamici: {data} {ora} {utente} {file} {pagina} {pagine}");
-                !s.text.trim().is_empty()
+                s.text = ed.lines.iter().map(Line::to_string).collect::<Vec<_>>().join("\n");
+                let key = format!("{:?}{}", s.color, s.text);
+                if ed.preview.as_ref().is_none_or(|(k, _)| *k != key) {
+                    ed.preview = content(s, "documento.pdf", 1, 1).and_then(|c| overlay_texture(ui.ctx(), &c)).ok().map(|t| (key, t));
+                }
+                if let Some((_, t)) = &ed.preview {
+                    // Su cartoncino bianco, come nell'elenco a destra.
+                    let size = t.size_vec2();
+                    let fit = size * (380.0 / size.x).min(150.0 / size.y);
+                    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width().max(fit.x + 16.0), fit.y + 16.0), Sense::hover());
+                    ui.painter().rect_filled(rect, 4.0, Color32::WHITE);
+                    ui.painter().image(t.id(), Rect::from_center_size(rect.center(), fit), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                }
+                ed.lines.iter().any(|l| !l.text.trim().is_empty())
             };
             done = ui.add_enabled(ready && !s.name.trim().is_empty(), egui::Button::new("Salva")).clicked();
         });
@@ -1493,6 +1644,18 @@ fn main() -> eframe::Result {
             let mut fonts = egui::FontDefinitions::default();
             egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
             cc.egui_ctx.set_fonts(fonts);
+            // Disattivato = molto sbiadito; col tema scuro testo più chiaro, pulsanti più in
+            // rilievo e "attivo" nel blu pieno dell'accento.
+            cc.egui_ctx.all_styles_mut(|s| s.visuals.disabled_alpha = 0.3);
+            cc.egui_ctx.style_mut_of(egui::Theme::Dark, |s| {
+                let w = &mut s.visuals.widgets;
+                w.noninteractive.fg_stroke.color = Color32::from_gray(215);
+                w.inactive.fg_stroke.color = Color32::from_gray(235);
+                (w.inactive.weak_bg_fill, w.inactive.bg_fill) = (Color32::from_gray(72), Color32::from_gray(72));
+                (w.hovered.weak_bg_fill, w.hovered.bg_fill) = (Color32::from_gray(95), Color32::from_gray(95));
+                s.visuals.selection.bg_fill = ACCENT;
+                s.visuals.selection.stroke.color = Color32::WHITE;
+            });
             let mut app = App::new();
             if let Some(p) = arg {
                 app.open(p);
@@ -1500,4 +1663,22 @@ fn main() -> eframe::Result {
             Ok(Box::new(app))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remap_keeps_line_formats() {
+        let lines = vec![Line::parse("@bc14@TITOLO"), Line::parse("@il10@riga")];
+        // A capo in fondo al titolo: la riga nuova ne prende il formato, "riga" tiene il suo.
+        let after = remap("TITOLO\nriga", "TITOLO\nx\nriga", &lines);
+        assert_eq!(after.iter().map(|l| (l.text.as_str(), l.bold, l.size)).collect::<Vec<_>>(), [("TITOLO", true, 14.0), ("x", true, 14.0), ("riga", false, 10.0)]);
+        // Unire le due righe tiene il formato della prima.
+        let joined = remap("TITOLO\nriga", "TITOLOriga", &lines);
+        assert!(joined.len() == 1 && joined[0].bold && joined[0].text == "TITOLOriga");
+        // Testo scritto dentro una riga: formati invariati.
+        assert!(remap("TITOLO\nriga", "TITOLO\nrighe", &lines)[1] == Line { text: "righe".into(), ..lines[1].clone() });
+    }
 }

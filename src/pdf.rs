@@ -26,9 +26,68 @@ const NOTE_PAD: f32 = 2.0;
 /// Cosa viene impresso sulla pagina: una firma/immagine, un timbro di testo o testo libero.
 pub enum Content {
     Image(DynamicImage),
-    Text { lines: Vec<String>, color: [u8; 3] },
+    Text { lines: Vec<Line>, color: [u8; 3] },
     /// Testo libero, senza cornice; `size` è il corpo in punti.
     Note { text: String, color: [u8; 3], size: f32 },
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+/// Riga di un timbro di testo con la sua formattazione.
+#[derive(Clone, PartialEq)]
+pub struct Line {
+    pub text: String,
+    pub size: f32,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub align: Align,
+}
+
+/// Helvetica nelle quattro varianti, indicizzate da `Line::font`.
+const FONTS: [&str; 4] = ["Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique"];
+
+impl Line {
+    /// Legge una riga salvata come `@<b><i><u><l|c|r><corpo>@testo`. Senza prefisso è
+    /// grassetto centrato a 14 punti, come i timbri delle versioni precedenti.
+    pub fn parse(s: &str) -> Line {
+        let plain = Line { text: s.into(), size: SIZE, bold: true, italic: false, underline: false, align: Align::Center };
+        let Some((fmt, text)) = s.strip_prefix('@').and_then(|r| r.split_once('@')) else { return plain };
+        let digits: String = fmt.chars().filter(char::is_ascii_digit).collect();
+        let (Ok(size), true) = (digits.parse::<f32>(), fmt.chars().all(|c| c.is_ascii_digit() || "biulcr".contains(c))) else { return plain };
+        let align = if fmt.contains('l') { Align::Left } else if fmt.contains('r') { Align::Right } else { Align::Center };
+        Line { text: text.into(), size: size.clamp(4.0, 96.0), bold: fmt.contains('b'), italic: fmt.contains('i'), underline: fmt.contains('u'), align }
+    }
+
+    fn font(&self) -> usize {
+        self.bold as usize + 2 * self.italic as usize
+    }
+
+    /// Il corsivo (Oblique) ha le stesse larghezze del tondo.
+    fn width(&self) -> f32 {
+        text_width(&self.text, if self.bold { &BOLD } else { &REGULAR }, self.size)
+    }
+
+    fn lead(&self) -> f32 {
+        self.size * LEAD / SIZE
+    }
+}
+
+impl std::fmt::Display for Line {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let flag = |on, c| if on { c } else { "" };
+        let align = match self.align {
+            Align::Left => "l",
+            Align::Center => "c",
+            Align::Right => "r",
+        };
+        write!(f, "@{}{}{}{align}{}@{}", flag(self.bold, "b"), flag(self.italic, "i"), flag(self.underline, "u"), self.size.round(), self.text)
+    }
 }
 
 /// Oggetto posato su una pagina ma non ancora impresso: resta spostabile, ridimensionabile
@@ -53,8 +112,8 @@ impl Content {
         match self {
             Content::Image(img) => (100.0, 100.0 * img.height() as f32 / img.width().max(1) as f32),
             Content::Text { lines, .. } => {
-                let widest = lines.iter().map(|l| text_width(l, &BOLD, SIZE)).fold(0.0, f32::max);
-                (widest + 2.0 * PAD, lines.len() as f32 * LEAD + 2.0 * PAD)
+                let widest = lines.iter().map(Line::width).fold(0.0, f32::max);
+                (widest + 2.0 * PAD, lines.iter().map(Line::lead).sum::<f32>() + 2.0 * PAD)
             }
             Content::Note { text, size, .. } => {
                 let widest = text.split('\n').map(|l| text_width(l, &REGULAR, *size)).fold(0.0, f32::max);
@@ -198,7 +257,7 @@ fn stamp(doc: &mut Document, page: ObjectId, x: f32, y: f32, width: f32, rot: i6
     let (me, mf) = (x - (ma * w + mc * h) / 2.0, y - (mb * w + md * h) / 2.0);
 
     let name = format!("Pddf{}", doc.max_id + 1);
-    let (kind, resource, body) = match c {
+    let (kind, resources, body) = match c {
         Content::Image(img) => {
             let rgba = img.to_rgba8();
             let base = dictionary! {
@@ -216,25 +275,38 @@ fn stamp(doc: &mut Document, page: ObjectId, x: f32, y: f32, width: f32, rot: i6
             dict.set("SMask", mask);
             let rgb = rgba.pixels().flat_map(|p| [p[0], p[1], p[2]]).collect();
             let image = stream(doc, dict, "DeviceRGB", rgb);
-            ("XObject", image, format!("{w:.3} 0 0 {h:.3} 0 0 cm /{name} Do"))
+            let body = format!("{w:.3} 0 0 {h:.3} 0 0 cm /{name} Do");
+            ("XObject", vec![(name, image)], body)
         }
         Content::Text { lines, color } => {
-            let font = doc.add_object(dictionary! {
-                "Type" => "Font", "Subtype" => "Type1",
-                "BaseFont" => "Helvetica-Bold", "Encoding" => "WinAnsiEncoding",
-            });
             let [r, g, b] = color.map(|c| c as f32 / 255.0);
-            let mut body = format!(
-                "{r:.3} {g:.3} {b:.3} RG {r:.3} {g:.3} {b:.3} rg 2 w 1.5 1.5 {:.3} {:.3} re S BT /{name} {SIZE} Tf",
-                w - 3.0,
-                h - 3.0
-            );
-            for (k, line) in lines.iter().enumerate() {
-                // +4.5: la linea di base sta sopra il fondo della riga (spazio per i discendenti)
-                let (x, y) = ((w - text_width(line, &BOLD, SIZE)) / 2.0, h - PAD - (k as f32 + 1.0) * LEAD + 4.5);
-                body += &format!(" 1 0 0 1 {x:.3} {y:.3} Tm {} Tj", hex_string(line));
+            let mut body = format!("{r:.3} {g:.3} {b:.3} RG {r:.3} {g:.3} {b:.3} rg 2 w 1.5 1.5 {:.3} {:.3} re S BT", w - 3.0, h - 3.0);
+            // Le sottolineature sono rettangoli: vanno disegnate fuori dall'oggetto di testo.
+            let (mut fonts, mut under, mut top) = (vec![], String::new(), h - PAD);
+            for line in lines {
+                let font = format!("{name}F{}", line.font());
+                if !fonts.iter().any(|(n, _)| *n == font) {
+                    let id = doc.add_object(dictionary! {
+                        "Type" => "Font", "Subtype" => "Type1",
+                        "BaseFont" => FONTS[line.font()], "Encoding" => "WinAnsiEncoding",
+                    });
+                    fonts.push((font.clone(), id));
+                }
+                let tw = line.width();
+                let x = match line.align {
+                    Align::Left => PAD,
+                    Align::Center => (w - tw) / 2.0,
+                    Align::Right => w - PAD - tw,
+                };
+                top -= line.lead();
+                // La linea di base sta sopra il fondo della riga (spazio per i discendenti).
+                let (y, size) = (top + line.size * 4.5 / SIZE, line.size);
+                body += &format!(" /{font} {size:.2} Tf 1 0 0 1 {x:.3} {y:.3} Tm {} Tj", hex_string(&line.text));
+                if line.underline && tw > 0.0 {
+                    under += &format!(" {x:.3} {:.3} {tw:.3} {:.3} re f", y - 0.1 * size, 0.05 * size);
+                }
             }
-            ("Font", font, body + " ET")
+            ("Font", fonts, body + " ET" + &under)
         }
         Content::Note { text, color, size } => {
             let font = doc.add_object(dictionary! {
@@ -248,12 +320,12 @@ fn stamp(doc: &mut Document, page: ObjectId, x: f32, y: f32, width: f32, rot: i6
                 let y = h - NOTE_PAD - (k as f32 + 1.0) * size * 1.2 + size * 0.25;
                 body += &format!(" 1 0 0 1 {NOTE_PAD:.3} {y:.3} Tm {} Tj", hex_string(line));
             }
-            ("Font", font, body + " ET")
+            ("Font", vec![(name, font)], body + " ET")
         }
     };
 
     let ops = format!("q {ma:.5} {mb:.5} {mc:.5} {md:.5} {me:.3} {mf:.3} cm\n{body}\nQ");
-    draw_on_page(doc, page, kind, vec![(name, resource)], &ops)
+    draw_on_page(doc, page, kind, resources, &ops)
 }
 
 /// Imprime gli oggetti posati; quelli su pagine non più presenti vengono scartati.
@@ -874,7 +946,12 @@ mod tests {
         assert_eq!(widths(&d), [200, 300]);
 
         // Timbro di testo in alto a sinistra di una pagina ruotata: deve apparire lì, e solo lì.
-        let stamp = Content::Text { lines: vec!["APPROVATO".into(), "13/10/2026 è €".into()], color: [200, 0, 0] };
+        // Riga senza prefisso (vecchi timbri) e riga formattata; il formato si rilegge uguale.
+        let lines = vec![Line::parse("APPROVATO"), Line::parse("@iur10@13/10/2026 è € @x")];
+        assert!(lines[0].bold && lines[0].align == Align::Center && lines[0].size == SIZE);
+        assert!(!lines[1].bold && lines[1].italic && lines[1].underline && lines[1].align == Align::Right && lines[1].size == 10.0);
+        assert!(lines[1].text == "13/10/2026 è € @x" && Line::parse(&lines[1].to_string()) == lines[1]);
+        let stamp = Content::Text { lines, color: [200, 0, 0] };
         let (sw, sh) = stamp.size();
         assert!(sh < sw);
         for page in 0..2 {
