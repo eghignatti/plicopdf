@@ -256,7 +256,7 @@ fn stamp(doc: &mut Document, page: ObjectId, x: f32, y: f32, width: f32, rot: i6
     let (ma, mb, mc, md) = (scale * cos, scale * sin, -scale * sin, scale * cos);
     let (me, mf) = (x - (ma * w + mc * h) / 2.0, y - (mb * w + md * h) / 2.0);
 
-    let name = format!("Pddf{}", doc.max_id + 1);
+    let name = format!("Plico{}", doc.max_id + 1);
     let (kind, resources, body) = match c {
         Content::Image(img) => {
             let rgba = img.to_rgba8();
@@ -450,7 +450,7 @@ fn load_view(doc: &Document, root: ObjectId) -> Res<Pdf> {
                 continue;
             }
             let (sx, sy) = ((r[2] - r[0]) / (x1 - x0), (r[3] - r[1]) / (y1 - y0));
-            let name = format!("PddfA{}", items.len());
+            let name = format!("PlicoA{}", items.len());
             ops += &format!("q {sx:.5} 0 0 {sy:.5} {:.3} {:.3} cm /{name} Do Q\n", r[0] - x0 * sx, r[1] - y0 * sy);
             if let Ok(Object::Stream(stream)) = v.get_object_mut(id) {
                 stream.dict.set("Subtype", "Form"); // alcuni file lo omettono
@@ -973,7 +973,7 @@ mod tests {
         let sig = Content::Image(DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(40, 20, image::Rgba([0, 0, 120, 255]))));
         d.place(0, 100.0, 100.0, 80.0, &sig).unwrap();
         d.place(0, 100.0, 300.0, 80.0, &stamp).unwrap(); // un secondo oggetto sulla stessa pagina
-        let out = std::env::temp_dir().join("pddf-test.pdf");
+        let out = std::env::temp_dir().join("plicopdf-test.pdf");
         d.save(&out).unwrap();
         let mut again = Doc::open(&out).unwrap();
         assert_eq!(widths(&again), [200, 300]);
@@ -989,7 +989,7 @@ mod tests {
     #[test]
     fn extract_and_replace() {
         let mut d = Doc::from_bytes(&sample()).unwrap();
-        let out = std::env::temp_dir().join("pddf-test-estratte.pdf");
+        let out = std::env::temp_dir().join("plicopdf-test-estratte.pdf");
         write(&out, &d.extract(&[0, 2], &[]).unwrap()).unwrap();
         assert_eq!(widths(&Doc::open(&out).unwrap()), [100, 300]);
         assert_eq!(widths(&d), [100, 200, 300]);
@@ -1019,7 +1019,7 @@ mod tests {
         assert_eq!(d.to_view(1, x, y).unwrap(), (u, v));
         let item = Placed { page: d.page_key(1).unwrap(), x, y, width: 60.0, rot: d.page_rotation(1), content: note };
         d.move_page(1, 0).unwrap();
-        let out = std::env::temp_dir().join("pddf-test-oggetti.pdf");
+        let out = std::env::temp_dir().join("plicopdf-test-oggetti.pdf");
         write(&out, &d.extract(&[0], std::slice::from_ref(&item)).unwrap()).unwrap();
         let e = Doc::open(&out).unwrap();
         assert!(inked(&e, 0, 0.0, 0.0, 0.5, 0.5) && !inked(&e, 0, 0.5, 0.0, 1.0, 1.0) && !inked(&e, 0, 0.0, 0.5, 1.0, 1.0));
@@ -1089,7 +1089,7 @@ mod tests {
         assert_eq!(values(&d), ["Mario Rossi è qui", "Yes", "b"]);
 
         // I valori devono sopravvivere a salvataggio e riapertura, e fuori dai campi non c'è nulla.
-        let out = std::env::temp_dir().join("pddf-test-modulo.pdf");
+        let out = std::env::temp_dir().join("plicopdf-test-modulo.pdf");
         d.save(&out).unwrap();
         let again = Doc::open(&out).unwrap();
         assert_eq!(values(&again), ["Mario Rossi è qui", "Yes", "b"]);

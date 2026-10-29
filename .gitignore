@@ -1,4 +1,6 @@
 /target
-# PDF di prova locali: possono contenere moduli interni
+# PDF di prova locali
 /test-pdf
 _cantiere/
+# Note di lavoro locali, fuori dal repository pubblico
+LAVORO.md

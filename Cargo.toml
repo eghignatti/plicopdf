@@ -1,7 +1,10 @@
 [package]
-name = "pddf"
+name = "plicopdf"
 version = "0.1.0"
 edition = "2024"
+description = "Lightweight PDF editor: fill forms, sign, stamp, add text, rotate, reorder, insert, extract and replace pages."
+license = "GPL-3.0-or-later"
+repository = "https://github.com/eghignatti/plicopdf"
 
 [dependencies]
 chrono = "0.4.45"

@@ -24,15 +24,23 @@ struct Stamp {
 }
 
 fn config_dir() -> PathBuf {
-    // PDDF_CONFIG: cartella a parte, es. per le prove senza toccare firme e timbri veri.
-    if let Some(dir) = std::env::var_os("PDDF_CONFIG") {
+    // PLICOPDF_CONFIG: cartella a parte, es. per le prove senza toccare firme e timbri veri.
+    if let Some(dir) = std::env::var_os("PLICOPDF_CONFIG") {
         std::fs::create_dir_all(&dir).ok();
         return dir.into();
     }
     // Windows: %APPDATA%; Linux (anche dentro Flatpak): $XDG_CONFIG_HOME o ~/.config
     let var = |k| std::env::var_os(k).map(PathBuf::from);
     let base = var("APPDATA").or_else(|| var("XDG_CONFIG_HOME")).or_else(|| var("HOME").map(|h| h.join(".config")));
-    let dir = base.unwrap_or_else(|| ".".into()).join("pddf");
+    let base = base.unwrap_or_else(|| ".".into());
+    let (old, dir) = (base.join("pddf"), base.join("plicopdf"));
+    // Il programma si chiamava pddf: firme e timbri si spostano nella cartella nuova, e i
+    // percorsi delle immagini salvati in timbri.tsv con loro.
+    if !dir.exists() && std::fs::rename(&old, &dir).is_ok()
+        && let Ok(list) = std::fs::read_to_string(dir.join("timbri.tsv"))
+    {
+        std::fs::write(dir.join("timbri.tsv"), list.replace(&*old.to_string_lossy(), &dir.to_string_lossy())).ok();
+    }
     std::fs::create_dir_all(&dir).ok();
     dir
 }
@@ -1621,7 +1629,7 @@ impl eframe::App for App {
         }
 
         let dirty = if self.dirty() { "*" } else { "" };
-        let title = format!("{}{dirty} — pddf", self.file_name());
+        let title = format!("{}{dirty} — PlicoPDF", self.file_name());
         if title != self.title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.title = title;
@@ -1636,7 +1644,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "pddf",
+        "PlicoPDF",
         options,
         Box::new(|cc| {
             // Ctrl +/− ingrandisce la pagina, non l'intera interfaccia.
