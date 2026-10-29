@@ -36,4 +36,6 @@ Saved signatures and stamps are kept in `%APPDATA%\plicopdf` on Windows, and in 
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+Copyright (C) 2026 eghignatti. PlicoPDF is free software, released under the GNU General Public License, version 3 or (at your option) any later version. See [LICENSE](LICENSE).
+
+The binary also bundles third-party components under their own licenses: Rust crates under GPL-compatible licenses (MIT, Apache-2.0, BSD, Zlib and similar), plus fonts and data files shipped by egui and hayro (OFL-1.1, Ubuntu Font Licence, BSD-3-Clause, CC0).
