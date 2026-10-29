@@ -7,6 +7,8 @@ sdk-extensions:
 command: plicopdf
 finish-args:
   - --share=ipc
+  # Controllo degli aggiornamenti su GitHub all'avvio.
+  - --share=network
   - --socket=wayland
   - --socket=fallback-x11
   - --device=dri

@@ -75,6 +75,32 @@ fn save_stamps(stamps: &[Stamp]) {
     std::fs::write(config_dir().join("timbri.tsv"), out).ok();
 }
 
+const RELEASES: &str = "https://github.com/eghignatti/plicopdf/releases";
+
+/// Chiede a GitHub l'ultima versione pubblicata: Some se è più recente di questa.
+// ponytail: curl di sistema (c'è in Windows 10+ e su Linux) invece di un client HTTPS in Rust,
+// perché i TLS in Rust si portano dietro codice C (ring, aws-lc).
+fn newer_release() -> Option<String> {
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-sfL", "--max-time", "15", "https://api.github.com/repos/eghignatti/plicopdf/releases/latest"]);
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000); // senza finestra di console
+    newer(&String::from_utf8_lossy(&cmd.output().ok()?.stdout), env!("CARGO_PKG_VERSION"))
+}
+
+/// La versione del tag nella risposta di GitHub, se è più recente di `current`.
+fn newer(json: &str, current: &str) -> Option<String> {
+    let tag = json.split("\"tag_name\"").nth(1)?.split('"').nth(1)?.trim_start_matches('v');
+    let parse = |v: &str| v.split('.').map(|n| n.parse::<u32>().ok()).collect::<Option<Vec<_>>>();
+    (parse(tag)? > parse(current)?).then(|| tag.to_string())
+}
+
+/// Il pacchetto da scaricare per questo sistema, così come lo pubblica il workflow Release.
+fn download_url(version: &str) -> String {
+    let file = if cfg!(windows) { format!("PlicoPDF-{version}-x64.msi") } else { "PlicoPDF-x86_64.flatpak".into() };
+    format!("{RELEASES}/download/v{version}/{file}")
+}
+
 /// Apre un'immagine raddrizzandola secondo l'EXIF: le foto da telefono sono spesso ruotate.
 fn load_image(path: &Path) -> Res<image::DynamicImage> {
     use image::ImageDecoder;
@@ -380,6 +406,8 @@ enum Act {
 }
 
 struct App {
+    /// Versione più recente trovata su GitHub, scritta dal controllo all'avvio.
+    update: std::sync::Arc<std::sync::OnceLock<String>>,
     doc: Option<Doc>,
     path: Option<PathBuf>,
     cur: usize,
@@ -535,6 +563,7 @@ fn texture(ctx: &egui::Context, doc: &Doc, i: usize, px: i32) -> Option<TextureH
 impl App {
     fn new() -> Self {
         Self {
+            update: Default::default(),
             doc: None,
             path: None,
             cur: 0,
@@ -1607,7 +1636,18 @@ impl eframe::App for App {
                 (None, None, 0) => String::new(),
                 (None, None, k) => format!("{k} pagine selezionate (Esc per deselezionare)"),
             };
-            ui.label(if self.msg.is_empty() { &hint } else { &self.msg });
+            ui.horizontal(|ui| {
+                ui.label(if self.msg.is_empty() { &hint } else { &self.msg });
+                if let Some(v) = self.update.get() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let text = RichText::new(format!("{} Update", ph::ARROW_CIRCLE_DOWN)).color(Color32::WHITE).strong();
+                        let button = egui::Button::new(text).fill(Color32::from_rgb(30, 140, 60));
+                        if ui.add(button).on_hover_text(format!("È disponibile PlicoPDF {v}: clicca per scaricarlo")).clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(download_url(v)));
+                        }
+                    });
+                }
+            });
         });
         egui::Panel::left("pagine").default_size(180.0).show(ui, |ui| {
             act = self.thumbnails(ui).or(act.take());
@@ -1672,6 +1712,13 @@ fn main() -> eframe::Result {
                 s.visuals.selection.stroke.color = Color32::WHITE;
             });
             let mut app = App::new();
+            let (found, ctx) = (app.update.clone(), cc.egui_ctx.clone());
+            std::thread::spawn(move || {
+                if let Some(v) = newer_release() {
+                    found.set(v).ok();
+                    ctx.request_repaint();
+                }
+            });
             if let Some(p) = arg {
                 app.open(p);
             }
@@ -1683,6 +1730,15 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_check() {
+        let json = r#"{"url":"x","tag_name":"v0.10.0","name":"PlicoPDF 0.10.0"}"#;
+        assert_eq!(newer(json, "0.9.3").as_deref(), Some("0.10.0")); // confronto numerico, non di testo
+        assert_eq!(newer(json, "0.10.0"), None);
+        assert_eq!(newer(json, "1.0.0"), None);
+        assert_eq!(newer(r#"{"message":"Not Found"}"#, "0.1.0"), None);
+    }
 
     #[test]
     fn remap_keeps_line_formats() {

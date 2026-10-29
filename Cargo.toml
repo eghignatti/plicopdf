@@ -9,7 +9,7 @@ repository = "https://github.com/eghignatti/plicopdf"
 [dependencies]
 chrono = "0.4.45"
 # glow (OpenGL) e non wgpu: avvio più rapido, eseguibile più piccolo, gira anche su GPU datate.
-eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
+eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "glow", "links", "wayland", "x11"] }
 egui-phosphor = "0.14.0"
 hayro = "0.8.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }

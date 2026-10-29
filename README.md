@@ -11,6 +11,7 @@ A lightweight desktop PDF editor written in pure Rust. It is quick to start and 
 - Signatures, stamps and text stay movable, resizable and deletable until you save.
 - **Pages**: rotate, reorder, delete, insert another PDF, extract to a new PDF, replace with pages from another PDF.
 - Multiple undo, also across saves.
+- At startup it asks GitHub for the latest release; if there is a newer one, an **Update** button downloads the package for your system.
 
 The interface is currently in Italian.
 
