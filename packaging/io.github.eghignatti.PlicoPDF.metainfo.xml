@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.eghignatti.PlicoPDF</id>
+  <name>PlicoPDF</name>
+  <summary>Fill, sign, stamp and edit PDF files</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="io.github.eghignatti">
+    <name>eghignatti</name>
+  </developer>
+  <description>
+    <p>A lightweight PDF editor that stays responsive on older PCs.</p>
+    <ul>
+      <li>Fill in forms</li>
+      <li>Sign: draw a signature or extract it from a photo or scan</li>
+      <li>Text and image stamps, free text</li>
+      <li>Rotate, reorder, delete, insert, extract and replace pages</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.eghignatti.PlicoPDF.desktop</launchable>
+  <url type="homepage">https://github.com/eghignatti/plicopdf</url>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-10-29" />
+  </releases>
+</component>

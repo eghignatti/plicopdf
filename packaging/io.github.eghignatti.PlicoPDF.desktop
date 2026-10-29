@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=PlicoPDF
+GenericName=PDF Editor
+Comment=Fill, sign, stamp and edit PDF files
+Exec=plicopdf %f
+Icon=io.github.eghignatti.PlicoPDF
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/pdf;
+Keywords=pdf;sign;signature;stamp;form;

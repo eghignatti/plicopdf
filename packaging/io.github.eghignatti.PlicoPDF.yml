@@ -1,0 +1,36 @@
+id: io.github.eghignatti.PlicoPDF
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: plicopdf
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # Il salvataggio scrive un file temporaneo accanto al PDF e poi lo rinomina: serve la
+  # cartella intera, non il solo file che darebbe il portale.
+  - --filesystem=home
+modules:
+  - name: plicopdf
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/plicopdf/cargo
+      # ponytail: dipendenze scaricate durante la compilazione; per Flathub vanno
+      # elencate offline con flatpak-cargo-generator.
+      build-args:
+        - --share=network
+    build-commands:
+      - cargo build --release --locked
+      - install -Dm755 target/release/plicopdf /app/bin/plicopdf
+      - install -Dm644 packaging/io.github.eghignatti.PlicoPDF.desktop /app/share/applications/io.github.eghignatti.PlicoPDF.desktop
+      - install -Dm644 packaging/io.github.eghignatti.PlicoPDF.metainfo.xml /app/share/metainfo/io.github.eghignatti.PlicoPDF.metainfo.xml
+      - install -Dm644 packaging/plicopdf.svg /app/share/icons/hicolor/scalable/apps/io.github.eghignatti.PlicoPDF.svg
+    sources:
+      - type: dir
+        path: ..
+        skip: [target, _cantiere, test-pdf, .flatpak-builder]

@@ -1629,7 +1629,10 @@ impl eframe::App for App {
         }
 
         let dirty = if self.dirty() { "*" } else { "" };
-        let title = format!("{}{dirty} — PlicoPDF", self.file_name());
+        let title = match self.file_name() {
+            n if n.is_empty() => "PlicoPDF".into(),
+            n => format!("{n}{dirty} — PlicoPDF"),
+        };
         if title != self.title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.title = title;
@@ -1640,7 +1643,11 @@ impl eframe::App for App {
 fn main() -> eframe::Result {
     let arg = std::env::args().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 860.0]),
+        // app_id uguale al nome del file .desktop: su Wayland abbina finestra e icona.
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 860.0])
+            .with_app_id("io.github.eghignatti.PlicoPDF")
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../packaging/plicopdf-256.png")).unwrap_or_default()),
         ..Default::default()
     };
     eframe::run_native(

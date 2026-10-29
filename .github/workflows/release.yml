@@ -1,0 +1,58 @@
+# Pacchetti di rilascio: MSI per Windows e Flatpak per Linux.
+# Un tag vX.Y.Z (uguale alla versione in Cargo.toml) crea la Release con i due file;
+# "Run workflow" a mano li produce solo come artefatti, per prova.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release --locked
+      # WiX 5: le versioni 6 e successive chiedono di accettare una licenza a parte (OSMF).
+      - run: dotnet tool install --global wix --version 5.0.2
+      - name: MSI
+        shell: bash
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          wix build packaging/plicopdf.wxs -arch x64 -d Version=$v -o PlicoPDF-$v-x64.msi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: '*.msi'
+
+  linux:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: PlicoPDF-x86_64.flatpak
+          manifest-path: packaging/io.github.eghignatti.PlicoPDF.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.msi
+            *.flatpak
+          generate_release_notes: true

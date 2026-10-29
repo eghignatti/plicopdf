@@ -14,6 +14,13 @@ A lightweight desktop PDF editor written in pure Rust. It is quick to start and 
 
 The interface is currently in Italian.
 
+## Install
+
+Download the packages from [Releases](https://github.com/eghignatti/plicopdf/releases).
+
+- **Windows**: `PlicoPDF-<version>-x64.msi` installs for all users, so it needs administrator rights. It adds a Start menu entry and an "Open with" entry for PDF files. For silent deployment (GPO, Intune): `msiexec /i PlicoPDF-<version>-x64.msi /qn`.
+- **Linux**: `flatpak install --user PlicoPDF-x86_64.flatpak`. The Flathub remote must be configured, because the runtime comes from there.
+
 ## Build
 
 Requires a recent stable Rust toolchain (edition 2024).

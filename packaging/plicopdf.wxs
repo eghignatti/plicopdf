@@ -1,0 +1,32 @@
+<!-- Installer MSI per tutto il PC (WiX 5): wix build packaging/plicopdf.wxs -arch x64 -d Version=0.1.0 -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <!-- UpgradeCode fisso per sempre: è ciò che fa riconoscere e sostituire le versioni precedenti. -->
+  <Package Name="PlicoPDF" Manufacturer="eghignatti" Version="$(Version)" UpgradeCode="7c1f3b52-4e8a-4d0b-9a61-2f5d8c0e9b14" Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="È già installata una versione più recente di PlicoPDF." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="plicopdf.ico" SourceFile="packaging\plicopdf.ico" />
+    <Property Id="ARPPRODUCTICON" Value="plicopdf.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/eghignatti/plicopdf" />
+
+    <StandardDirectory Id="ProgramMenuFolder" />
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="PlicoPDF">
+        <Component>
+          <File Source="target\release\plicopdf.exe" KeyPath="yes">
+            <Shortcut Name="PlicoPDF" Description="Editor PDF" Directory="ProgramMenuFolder" Advertise="yes" Icon="plicopdf.ico" WorkingDirectory="INSTALLFOLDER" />
+          </File>
+          <!-- Compare in "Apri con" per i PDF, senza togliere il programma predefinito. -->
+          <ProgId Id="PlicoPDF.pdf" Description="Documento PDF" Icon="plicopdf.ico" Advertise="yes">
+            <Extension Id="pdf" ContentType="application/pdf">
+              <Verb Id="open" Command="Apri con PlicoPDF" Argument="&quot;%1&quot;" />
+            </Extension>
+          </ProgId>
+        </Component>
+        <Component>
+          <File Source="LICENSE" Name="LICENSE.txt" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+  </Package>
+</Wix>
