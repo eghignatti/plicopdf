@@ -1,41 +1,59 @@
-# Pacchetti di rilascio: MSI per Windows e Flatpak per Linux.
-# Un tag vX.Y.Z (uguale alla versione in Cargo.toml) crea la Release con i due file;
-# "Run workflow" a mano li produce solo come artefatti, per prova.
+# Rilascio automatico: a ogni push su main, se la versione in Cargo.toml non ha ancora il suo
+# tag vX.Y.Z, compila MSI (Windows) e Flatpak (Linux) e pubblica la Release con i due file.
+# Per rilasciare basta alzare la versione e fare push. "Run workflow" fa lo stesso controllo.
 name: Release
 
 on:
   push:
-    tags: ['v*']
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  windows:
-    runs-on: windows-latest
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      new: ${{ steps.v.outputs.new }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - id: v
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/v$v" > /dev/null; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+            echo "La versione $v è già pubblicata: niente da fare."
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  windows:
+    needs: version
+    if: needs.version.outputs.new == 'true'
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v7
       - run: cargo build --release --locked
       # WiX 5: le versioni 6 e successive chiedono di accettare una licenza a parte (OSMF).
       - run: dotnet tool install --global wix --version 5.0.2
-      - name: MSI
-        shell: bash
-        run: |
-          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          wix build packaging/plicopdf.wxs -arch x64 -d Version=$v -o PlicoPDF-$v-x64.msi
-      - uses: actions/upload-artifact@v4
+      - run: wix build packaging/plicopdf.wxs -arch x64 -d Version=${{ needs.version.outputs.version }} -o PlicoPDF-${{ needs.version.outputs.version }}-x64.msi
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: '*.msi'
 
   linux:
-    runs-on: ubuntu-latest
+    needs: version
+    if: needs.version.outputs.new == 'true'
+    runs-on: ubuntu-24.04
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
       options: --privileged
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
           bundle: PlicoPDF-x86_64.flatpak
@@ -43,16 +61,16 @@ jobs:
           cache-key: flatpak-builder-${{ github.sha }}
 
   release:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [windows, linux]
-    runs-on: ubuntu-latest
+    needs: [version, windows, linux]
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            *.msi
-            *.flatpak
-          generate_release_notes: true
+      # La Release crea anche il tag, sul commit appena compilato.
+      - run: |
+          gh release create "v$VERSION" *.msi *.flatpak --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "PlicoPDF $VERSION" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
