@@ -54,6 +54,10 @@ jobs:
       options: --privileged
     steps:
       - uses: actions/checkout@v7
+      # SDK e runtime preinstallati stanno nello strato di sola lettura dell'immagine: quando
+      # Flathub ne pubblica un aggiornamento, flatpak non riesce a sostituirli ("Invalid
+      # cross-device link"). Copiati, diventano aggiornabili.
+      - run: cp -a /var/lib/flatpak /var/lib/flatpak.copia && rm -rf /var/lib/flatpak && mv /var/lib/flatpak.copia /var/lib/flatpak
       - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
           bundle: PlicoPDF-x86_64.flatpak
