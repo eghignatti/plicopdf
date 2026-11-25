@@ -8,6 +8,8 @@ A lightweight desktop PDF editor written in pure Rust. It is quick to start and 
 - **Signatures**: draw one with the mouse, or extract the ink stroke from a photo or scan of your handwritten signature. The paper background is removed automatically.
 - **Stamps**: text stamps with per-line formatting (size, bold, italic, underline, alignment) and dynamic fields (`{data}`, `{ora}`, `{utente}`, `{file}`, `{pagina}`, `{pagine}`), or image stamps and logos.
 - **Free text** anywhere on the page.
+- **Text selection**: drag over the page text to select it, Ctrl+C to copy, and **highlight** it in yellow (a standard highlight annotation).
+- **Print** with the system dialog (on Linux through the desktop print portal, also inside Flatpak).
 - Signatures, stamps and text stay movable, resizable and deletable until you save.
 - **Pages**: rotate, reorder, delete, insert another PDF, extract to a new PDF, replace with pages from another PDF.
 - Multiple undo, also across saves.

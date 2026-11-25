@@ -3,8 +3,12 @@
 use std::path::Path;
 use std::rc::Rc;
 
-use hayro::hayro_interpret::InterpreterSettings;
+use hayro::hayro_interpret::font::{Glyph, GlyphRun};
+use hayro::hayro_interpret::hayro_cmap::BfString;
+use hayro::hayro_interpret::util::TransformExt;
+use hayro::hayro_interpret::{BlendMode, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps, InterpreterCache, InterpreterSettings, SoftMask, interpret_page};
 use hayro::hayro_syntax::Pdf;
+use hayro::kurbo::{BezPath, Point};
 use hayro::hayro_syntax::page::Page;
 use hayro::vello_cpu::color::AlphaColor;
 use hayro::vello_cpu::color::Srgb;
@@ -337,10 +341,15 @@ fn stamp_all(doc: &mut Document, root: ObjectId, items: &[Placed]) -> Res<()> {
     Ok(())
 }
 
+/// Le annotazioni le disegna già `baked`, nel contenuto della pagina: hayro non deve ripeterle.
+fn settings() -> InterpreterSettings {
+    InterpreterSettings { render_annotations: false, ..Default::default() }
+}
+
 fn render_page(page: &Page, width_px: i32, bg: AlphaColor<Srgb>) -> (usize, usize, Vec<u8>) {
     let scale = width_px.max(1) as f32 / page.render_dimensions().0;
     let settings = PixmapSettings { x_scale: scale, y_scale: scale, bg_color: bg };
-    let pm = hayro::render(page, &RenderCache::new(), &InterpreterSettings::default(), &RenderSettings::default(), &settings);
+    let pm = hayro::render(page, &RenderCache::new(), &self::settings(), &RenderSettings::default(), &settings);
     (pm.width() as usize, pm.height() as usize, pm.data_as_u8_slice().to_vec())
 }
 
@@ -429,10 +438,16 @@ fn serialize(doc: &mut Document) -> Res<Vec<u8>> {
     Ok(out)
 }
 
-/// Prepara il documento per il renderer. hayro non disegna le annotazioni (campi dei moduli,
-/// commenti, timbri di altri programmi): qui, su una copia, i loro aspetti vengono stampati
-/// nel contenuto della pagina. Il documento vero resta intatto.
+/// Prepara il documento per il renderer: su una copia, gli aspetti delle annotazioni (campi
+/// dei moduli, evidenziazioni, timbri di altri programmi) vengono stampati nel contenuto della
+/// pagina, con le regole di visibilità di `appearance`. Il documento vero resta intatto.
 fn load_view(doc: &Document, root: ObjectId) -> Res<Pdf> {
+    let mut out = vec![];
+    baked(doc, root)?.save_to(&mut out)?;
+    Pdf::new(out).map_err(|e| format!("PDF non visualizzabile: {e:?}").into())
+}
+
+fn baked(doc: &Document, root: ObjectId) -> Res<Document> {
     let mut v = doc.clone();
     for page in kids_of(&v, root)? {
         let annots = match v.get_dictionary(page)?.get_deref(b"Annots", &v) {
@@ -461,9 +476,153 @@ fn load_view(doc: &Document, root: ObjectId) -> Res<Pdf> {
             draw_on_page(&mut v, page, "XObject", items, &ops)?;
         }
     }
-    let mut out = vec![];
-    v.save_to(&mut out)?;
-    Pdf::new(out).map_err(|e| format!("PDF non visualizzabile: {e:?}").into())
+    Ok(v)
+}
+
+/// Un carattere del testo della pagina, con il suo riquadro in punti dall'angolo in alto a
+/// sinistra della pagina a video: [x0, y0, x1, y1], e la riga a cui appartiene.
+pub struct Char {
+    pub text: String,
+    pub rect: [f32; 4],
+    pub line: usize,
+}
+
+/// Raccoglie i caratteri disegnati, nell'ordine del contenuto.
+struct Glyphs(Vec<Char>);
+
+impl<'a> Device<'a> for Glyphs {
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {}
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
+    fn draw_glyph_run(&mut self, run: &GlyphRun<'_, 'a>, props: DrawProps<'a>, _: &DrawMode) {
+        for g in run.glyphs() {
+            let text = match g.as_unicode() {
+                Some(BfString::Char(c)) => c.to_string(),
+                Some(BfString::String(s)) => s,
+                None => continue,
+            };
+            // Il glifo occupa un em (1000 unità) in altezza, dal discendente all'ascendente.
+            let adv = match &**g {
+                Glyph::Outline(o) => o.advance_width(),
+                _ => None,
+            };
+            let (adv, t) = (adv.unwrap_or(500.0) as f64, props.transform * g.transform());
+            let p = [(0.0, -200.0), (adv, -200.0), (0.0, 800.0), (adv, 800.0)].map(|(x, y)| t * Point::new(x, y));
+            let (x, y) = (p.map(|p| p.x as f32), p.map(|p| p.y as f32));
+            let min = |v: [f32; 4]| v.into_iter().fold(f32::MAX, f32::min);
+            let max = |v: [f32; 4]| v.into_iter().fold(f32::MIN, f32::max);
+            self.0.push(Char { text, rect: [min(x), min(y), max(x), max(y)], line: 0 });
+        }
+    }
+    fn draw_image(&mut self, _: Image<'a, '_>, _: ImageDrawProps<'a>) {}
+    fn pop_clip(&mut self) {}
+    fn pop_transparency_group(&mut self) {}
+}
+
+/// Mette i caratteri in ordine di lettura: righe dall'alto in basso, ognuna da sinistra a destra.
+/// Un carattere sta nella riga se il suo centro cade nell'altezza della riga.
+// ponytail: due colonne affiancate finiscono nelle stesse righe; per i testi a colonne
+// servirebbe raggruppare anche per distanza orizzontale.
+fn reading_order(mut chars: Vec<Char>) -> Vec<Char> {
+    let mid = |c: &Char| (c.rect[1] + c.rect[3]) / 2.0;
+    chars.sort_by(|a, b| mid(a).total_cmp(&mid(b)));
+    let mut lines: Vec<(f32, f32, Vec<Char>)> = vec![];
+    for c in chars {
+        match lines.last_mut() {
+            Some((top, bottom, line)) if mid(&c) < *bottom => {
+                (*top, *bottom) = (top.min(c.rect[1]), bottom.max(c.rect[3]));
+                line.push(c);
+            }
+            _ => lines.push((c.rect[1], c.rect[3], vec![c])),
+        }
+    }
+    let mut out: Vec<Char> = vec![];
+    for (n, (_, _, mut line)) in lines.into_iter().enumerate() {
+        line.sort_by(|a, b| a.rect[0].total_cmp(&b.rect[0]));
+        for c in line {
+            // Il grassetto finto è lo stesso testo disegnato due volte, quasi nello stesso punto.
+            let twin = out.last().is_some_and(|p| p.line == n && p.text == c.text && (p.rect[0] - c.rect[0]).abs() < 0.5);
+            if !twin {
+                out.push(Char { line: n, ..c });
+            }
+        }
+    }
+    out
+}
+
+/// Il testo dei caratteri: a capo quando cambia la riga, uno spazio dove c'è un vuoto.
+pub fn text_of(chars: &[Char]) -> String {
+    let mut s = String::new();
+    for (i, c) in chars.iter().enumerate() {
+        if let Some(p) = i.checked_sub(1).map(|i| &chars[i]) {
+            let h = (p.rect[3] - p.rect[1]).min(c.rect[3] - c.rect[1]);
+            if c.line != p.line {
+                s.push('\n');
+            } else if c.rect[0] - p.rect[2] > h * 0.15 && !s.ends_with(' ') && !c.text.starts_with(' ') {
+                s.push(' ');
+            }
+        }
+        s += &c.text;
+    }
+    s
+}
+
+/// Un riquadro per riga di testo, che copre i caratteri visibili della riga.
+pub fn line_boxes(chars: &[Char]) -> Vec<[f32; 4]> {
+    let mut out: Vec<(usize, [f32; 4])> = vec![];
+    for c in chars.iter().filter(|c| !c.text.trim().is_empty()) {
+        let r = c.rect;
+        match out.last_mut() {
+            Some((line, b)) if *line == c.line => *b = [b[0].min(r[0]), b[1].min(r[1]), b[2].max(r[2]), b[3].max(r[3])],
+            _ => out.push((c.line, r)),
+        }
+    }
+    out.into_iter().map(|(_, b)| b).collect()
+}
+
+/// Dove cade il cursore di testo per il punto `p` (punti a video): l'indice del carattere
+/// davanti al quale si trova. Vale la riga più vicina in verticale, anche fuori dal testo.
+pub fn caret(chars: &[Char], p: (f32, f32)) -> usize {
+    let mut bands: Vec<[f32; 2]> = vec![];
+    for c in chars {
+        if bands.len() <= c.line {
+            bands.resize(c.line + 1, [f32::MAX, f32::MIN]);
+        }
+        bands[c.line] = [bands[c.line][0].min(c.rect[1]), bands[c.line][1].max(c.rect[3])];
+    }
+    let gap = |b: &[f32; 2]| (b[0] - p.1).max(p.1 - b[1]).max(0.0);
+    let Some(line) = bands.iter().enumerate().min_by(|a, b| gap(a.1).total_cmp(&gap(b.1))).map(|(l, _)| l) else { return 0 };
+    let first = chars.iter().position(|c| c.line == line).unwrap_or(0);
+    first + chars[first..].iter().take_while(|c| c.line == line && (c.rect[0] + c.rect[2]) / 2.0 < p.0).count()
+}
+
+/// Annotazione di evidenziazione sui riquadri dati, in spazio utente. Il giallo è in
+/// moltiplicazione: il testo sotto resta nero e leggibile.
+fn add_highlight(doc: &mut Document, page: ObjectId, boxes: &[[f32; 4]]) -> Res<()> {
+    let r = boxes.iter().fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]);
+    let mut ops = String::from("/G gs 1 0.9 0.2 rg\n");
+    let mut quads = vec![];
+    for b in boxes {
+        ops += &format!("{:.2} {:.2} {:.2} {:.2} re\n", b[0], b[1], b[2] - b[0], b[3] - b[1]);
+        // Ordine di Acrobat: in alto a sinistra, in alto a destra, in basso a sinistra, in basso a destra.
+        quads.extend([b[0], b[3], b[2], b[3], b[0], b[1], b[2], b[1]].map(Object::from));
+    }
+    ops += "f\n";
+    let rect = || r.map(Object::from).to_vec();
+    let gs = dictionary! { "Type" => "ExtGState", "BM" => "Multiply" };
+    let ap = Stream::new(dictionary! { "Type" => "XObject", "Subtype" => "Form", "BBox" => rect(), "Resources" => dictionary! { "ExtGState" => dictionary! { "G" => gs } } }, ops.into_bytes());
+    let ap = doc.add_object(ap);
+    let annot = dictionary! { "Type" => "Annot", "Subtype" => "Highlight", "Rect" => rect(), "QuadPoints" => quads, "C" => vec![1.0.into(), 0.9.into(), 0.2.into()], "F" => 4, "P" => page, "AP" => dictionary! { "N" => ap } };
+    let annot = Object::Reference(doc.add_object(annot));
+    match doc.get_dictionary(page)?.get(b"Annots").cloned() {
+        Ok(Object::Reference(id)) if doc.get_object(id).is_ok_and(|o| o.as_array().is_ok()) => doc.get_object_mut(id)?.as_array_mut()?.push(annot),
+        Ok(Object::Array(mut a)) => {
+            a.push(annot);
+            doc.get_dictionary_mut(page)?.set("Annots", a);
+        }
+        _ => doc.get_dictionary_mut(page)?.set("Annots", vec![annot]),
+    }
+    Ok(())
 }
 
 pub enum FieldKind {
@@ -695,6 +854,43 @@ impl Doc {
         self.edit(|s| stamp(&mut s.doc, id, x, y, width, rot, c))
     }
 
+    /// Caratteri della pagina `i`, per selezionarne il testo.
+    pub fn chars(&self, i: usize) -> Vec<Char> {
+        let Some(page) = self.view.pages().get(i) else { return vec![] };
+        let (w, h) = page.render_dimensions();
+        let bbox = hayro::kurbo::Rect::new(0.0, 0.0, w as f64, h as f64);
+        let mut ctx = Context::new(page.initial_transform(true).to_kurbo(), bbox, &InterpreterCache::new(), page.xref(), settings());
+        let mut dev = Glyphs(vec![]);
+        interpret_page(page, &mut ctx, &mut dev);
+        reading_order(dev.0)
+    }
+
+    /// Evidenzia, pagina per pagina, i riquadri dati in coordinate a video (vedi `Char`):
+    /// un solo passo annullabile.
+    pub fn highlight(&mut self, parts: &[(usize, Vec<[f32; 4]>)]) -> Res<()> {
+        let mut todo = vec![];
+        for (i, boxes) in parts.iter().filter(|p| !p.1.is_empty()) {
+            let mut user = vec![];
+            for b in boxes {
+                let (p, q) = (self.to_user(*i, b[0], b[1]).ok_or("pagina inesistente")?, self.to_user(*i, b[2], b[3]).ok_or("pagina inesistente")?);
+                user.push([p.0.min(q.0), p.1.min(q.1), p.0.max(q.0), p.1.max(q.1)]);
+            }
+            todo.push((self.page_id(*i)?, user));
+        }
+        self.edit(|s| todo.iter().try_for_each(|(id, user)| add_highlight(&mut s.doc, *id, user)))
+    }
+
+    /// Il PDF da stampare: oggetti posati impressi e annotazioni nel contenuto, come a video.
+    pub fn printable(&self, items: &[Placed]) -> Res<Vec<u8>> {
+        let mut v = self.doc.clone();
+        stamp_all(&mut v, self.root, items)?;
+        let mut v = baked(&v, self.root)?;
+        for page in kids_of(&v, self.root)? {
+            v.get_dictionary_mut(page)?.remove(b"Annots");
+        }
+        serialize(&mut v)
+    }
+
     /// Imprime gli oggetti posati, in un solo passo annullabile.
     pub fn flatten(&mut self, items: &[Placed]) -> Res<()> {
         if items.is_empty() {
@@ -921,6 +1117,43 @@ mod tests {
         let (xa, xb) = ((x0 * w as f32) as usize, (x1 * w as f32) as usize);
         let (ya, yb) = ((y0 * h as f32) as usize, (y1 * h as f32) as usize);
         (ya..yb).any(|y| (xa..xb).any(|x| px[(y * w + x) * 4..][..3] != [255, 255, 255]))
+    }
+
+    #[test]
+    fn text_select_and_highlight() {
+        let mut d = Doc::from_bytes(&sample()).unwrap();
+        let note = Content::Note { text: "Ciao mondo
+riga due".into(), color: [0, 0, 0], size: 12.0 };
+        d.place(2, 150.0, 100.0, 120.0, &note).unwrap();
+        let chars = d.chars(2);
+        assert_eq!(text_of(&chars), "Ciao mondo
+riga due");
+        let boxes = line_boxes(&chars);
+        assert_eq!(boxes.len(), 2);
+        // Riquadri attorno al punto di posa, in coordinate a video.
+        assert!(boxes[0][1] < 100.0 && boxes[1][3] > 100.0 && boxes[0][0] > 90.0 && boxes[0][2] < 210.0, "{boxes:?}");
+        // Il cursore: davanti alla prima lettera, dopo l'ultima della riga, sulla riga più vicina.
+        let (b0, b1) = (boxes[0], boxes[1]);
+        assert_eq!(caret(&chars, (b0[0] - 5.0, (b0[1] + b0[3]) / 2.0)), 0);
+        assert_eq!(caret(&chars, (b0[2] + 50.0, b0[1] - 30.0)), "Ciao mondo".len());
+        assert_eq!(caret(&chars, (b1[0] + 1.0, b1[3] + 30.0)), "Ciao mondo".len());
+        d.highlight(&[(2, boxes[..1].to_vec())]).unwrap();
+        // Giallo in moltiplicazione: fondo giallo, lettere ancora scure, seconda riga intatta.
+        let (w, h, px) = d.render(2, 300).unwrap();
+        let at = |x: f32, y: f32| px[(((y * h as f32 / 400.0) as usize) * w + (x * w as f32 / 300.0) as usize) * 4..][..3].to_vec();
+        let b = boxes[0];
+        let row: Vec<_> = (b[0] as i32..b[2] as i32).map(|x| at(x as f32, (b[1] + b[3]) / 2.0)).collect();
+        assert!(row.iter().any(|p| p[0] > 200 && p[2] < 120), "manca il giallo");
+        assert!(row.iter().any(|p| p[0] < 90), "testo coperto");
+        let b = boxes[1];
+        assert!((b[0] as i32..b[2] as i32).map(|x| at(x as f32, (b[1] + b[3]) / 2.0)).all(|p| p[0] as i32 - (p[2] as i32) < 60));
+        // In stampa: evidenziazione impressa nel contenuto, nessuna annotazione rimasta.
+        let print = Doc::from_bytes(&d.printable(&[]).unwrap()).unwrap();
+        assert!(print.doc.get_dictionary(print.page_id(2).unwrap()).unwrap().get(b"Annots").is_err());
+        let (w2, _, px2) = print.render(2, 300).unwrap();
+        assert_eq!((w2, &px2), (w, &px));
+        d.undo().unwrap();
+        assert!(d.doc.get_dictionary(d.page_id(2).unwrap()).unwrap().get(b"Annots").is_err());
     }
 
     #[test]

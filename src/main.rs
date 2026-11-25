@@ -2,6 +2,7 @@
 
 mod ink;
 mod pdf;
+mod print;
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -9,7 +10,7 @@ use std::rc::Rc;
 
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextureHandle, load::SizedTexture, vec2};
 use egui_phosphor::regular as ph;
-use pdf::{Align, Content, Doc, Field, FieldKind, Line, ObjectId, Placed, Res};
+use pdf::{Align, Char, Content, Doc, Field, FieldKind, Line, ObjectId, Placed, Res};
 
 const INK: [u8; 3] = [15, 25, 90];
 const ACCENT: Color32 = Color32::from_rgb(40, 110, 220);
@@ -403,6 +404,8 @@ enum Act {
     Place(usize, f32, f32),
     /// Nuovo valore per un campo del modulo.
     Field(ObjectId, String),
+    /// Evidenzia il testo selezionato.
+    Highlight,
 }
 
 struct App {
@@ -426,6 +429,17 @@ struct App {
     follow: bool,
     /// Campi compilabili delle pagine visibili.
     forms: HashMap<usize, Vec<Field>>,
+    /// Caratteri delle pagine visibili, per selezionare il testo.
+    texts: HashMap<usize, Vec<Char>>,
+    /// Testo selezionato trascinando, dal punto di partenza a quello d'arrivo (in qualunque
+    /// ordine): (pagina, posizione del cursore di testo nei caratteri della pagina).
+    select: Option<((usize, usize), (usize, usize))>,
+    /// Il trascinamento della selezione è in corso.
+    selecting: bool,
+    /// L'ultimo clic è stato sulle pagine (true) o sulle miniature: decide cosa seleziona Ctrl+A.
+    on_text: bool,
+    /// Stampa in corso: il thread manda il messaggio finale.
+    printing: Option<std::sync::mpsc::Receiver<String>>,
     /// Campo di testo in corso di modifica, col testo non ancora confermato.
     editing: Option<(ObjectId, String)>,
     /// Il campo in modifica deve ancora ricevere il cursore.
@@ -577,6 +591,11 @@ impl App {
             goto: None,
             follow: false,
             forms: HashMap::new(),
+            texts: HashMap::new(),
+            select: None,
+            selecting: false,
+            on_text: false,
+            printing: None,
             editing: None,
             focus: false,
             thumbs: HashMap::new(),
@@ -610,6 +629,8 @@ impl App {
     fn refresh(&mut self) {
         self.thumbs.clear();
         self.forms.clear();
+        self.texts.clear();
+        self.select = None;
         // Le pagine restano a video con la vecchia immagine finché non vengono ridisegnate.
         self.view.values_mut().for_each(|v| v.0 = -1);
     }
@@ -625,6 +646,42 @@ impl App {
 
     fn placed(&self) -> Vec<Placed> {
         self.items.iter().map(|o| o.item.clone()).collect()
+    }
+
+    /// I caratteri selezionati, pagina per pagina, in ordine di lettura.
+    fn selected(&self) -> Vec<(usize, &[Char])> {
+        let Some((a, b)) = self.select else { return vec![] };
+        let (a, b) = (a.min(b), a.max(b));
+        let part = |page: usize| {
+            let t = self.texts.get(&page)?;
+            let from = if page == a.0 { a.1.min(t.len()) } else { 0 };
+            let to = if page == b.0 { b.1.min(t.len()) } else { t.len() };
+            Some((page, t.get(from..to.max(from))?))
+        };
+        (a.0..=b.0).filter_map(part).filter(|(_, s)| !s.is_empty()).collect()
+    }
+
+    fn selected_text(&self) -> String {
+        self.selected().iter().map(|(_, s)| pdf::text_of(s)).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Stampa ciò che si vede, oggetti posati compresi, senza bloccare la finestra.
+    fn print(&mut self, ctx: &egui::Context) {
+        let Some(doc) = &self.doc else { return };
+        if self.printing.is_some() {
+            return;
+        }
+        let bytes = match doc.printable(&self.placed()) {
+            Ok(b) => b,
+            Err(e) => return self.msg = format!("Stampa non riuscita: {e}"),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (title, ctx) = (self.file_name(), ctx.clone());
+        std::thread::spawn(move || {
+            tx.send(print::print(bytes, &title).unwrap_or_else(|e| format!("Stampa non riuscita: {e}"))).ok();
+            ctx.request_repaint();
+        });
+        self.printing = Some(rx);
     }
 
     fn open(&mut self, path: PathBuf) {
@@ -720,9 +777,10 @@ impl App {
 
     fn apply(&mut self, ctx: &egui::Context, act: Act) {
         let (file, cur, pages, placed) = (self.file_name(), self.cur, self.targets(), self.placed());
+        let marks: Vec<_> = if matches!(act, Act::Highlight) { self.selected().into_iter().map(|(p, s)| (p, pdf::line_boxes(s))).collect() } else { vec![] };
         let Some(d) = &mut self.doc else { return };
         let structural = matches!(act, Act::Rotate(_) | Act::Move(..) | Act::Delete | Act::Insert(_) | Act::Replace(_));
-        let edits_doc = structural || matches!(act, Act::Field(..));
+        let edits_doc = structural || matches!(act, Act::Field(..) | Act::Highlight);
         if matches!(act, Act::Move(..) | Act::Delete | Act::Undo | Act::Insert(_) | Act::Replace(_)) {
             self.sel.clear(); // gli indici selezionati non indicano più le stesse pagine
         }
@@ -774,6 +832,7 @@ impl App {
                     self.picked = None;
                 }
                 Act::Field(id, value) => d.set_field(id, &value)?,
+                Act::Highlight => d.highlight(&marks)?,
                 Act::Place(page, u, v) => {
                     if let Some(t) = self.tool.take() {
                         let (x, y) = d.to_user(page, u, v).ok_or("pagina inesistente")?;
@@ -833,6 +892,9 @@ impl App {
                 if icon(ui, ph::FLOPPY_DISK_BACK, "Salva con nome…", has) {
                     self.save(true);
                 }
+                if icon(ui, ph::PRINTER, "Stampa (Ctrl+P)", has && self.printing.is_none()) {
+                    self.print(ui.ctx());
+                }
             });
             ui.separator();
             // Visualizza al centro dello spazio libero, Modifica in fondo a destra: si usano le
@@ -873,9 +935,13 @@ impl App {
                 if labeled(ui, ph::TEXT_T, "Testo", "Aggiungi testo: poi clicca sulla pagina", text_on, has) {
                     act = Some(Act::Tool(None));
                 }
+                let tip = "Evidenzia in giallo il testo selezionato (trascina sul testo per selezionarlo)";
+                if labeled(ui, ph::HIGHLIGHTER, "Evidenzia", tip, false, !self.selected().is_empty()) {
+                    act = Some(Act::Highlight);
+                }
                 ui.separator();
                 let k = self.targets().len();
-                let which = "la pagina corrente, o quelle selezionate con Ctrl/Maiusc + clic sulle miniature (Ctrl+A tutte)";
+                let which = "la pagina corrente, o quelle selezionate con Ctrl/Maiusc + clic sulle miniature (dopo un clic su una miniatura, Ctrl+A le seleziona tutte)";
                 if labeled(ui, ph::ARROW_COUNTER_CLOCKWISE, "Antiorario", &format!("Ruota in senso antiorario {which}"), false, has) {
                     act = Some(Act::Rotate(-1));
                 }
@@ -1278,6 +1344,9 @@ impl App {
 
                 // Clic = va alla pagina; Ctrl + clic aggiunge o toglie dalla selezione, Maiusc + clic
                 // seleziona dalla pagina corrente a questa; trascinamento = sposta la pagina.
+                if resp.clicked() || resp.drag_started() {
+                    self.on_text = false;
+                }
                 if resp.clicked() {
                     let m = ui.input(|i| i.modifiers);
                     if m.shift {
@@ -1379,6 +1448,7 @@ impl App {
         let mut budget = 1; // al massimo un rendering per fotogramma, per non bloccare lo scorrimento
         let mut most_visible = (0.0, self.cur);
         let mut seen = (usize::MAX, 0);
+        let mut copy = false;
         let out = area.show_viewport(ui, |ui, _| {
             let (outer, _) = ui.allocate_exact_size(vec2(content_w(zoom), total_h), Sense::hover());
             let painter = ui.painter().clone();
@@ -1412,7 +1482,7 @@ impl App {
                 }
                 painter.rect_stroke(rect, 0.0, Stroke::new(1.0, Color32::GRAY), StrokeKind::Outside);
 
-                let resp = ui.interact(rect, ui.id().with(("pagina", i)), Sense::click());
+                let resp = ui.interact(rect, ui.id().with(("pagina", i)), Sense::click_and_drag());
                 // Moduli: i campi si compilano direttamente sulla pagina (non mentre si posiziona un timbro).
                 let fields = self.forms.entry(i).or_insert_with(|| doc.fields(i));
                 for (k, f) in fields.iter().enumerate().filter(|_| !placing) {
@@ -1469,8 +1539,56 @@ impl App {
                         _ => {}
                     }
                 }
+                if resp.clicked() || resp.drag_started() {
+                    self.on_text = true;
+                }
                 if resp.clicked() && !placing {
-                    self.picked = None;
+                    (self.picked, self.select) = (None, None);
+                }
+
+                // Testo: si seleziona trascinando, come in un editor. Il punto d'arrivo segue il
+                // puntatore anche sulle altre pagine.
+                let chars: &Vec<Char> = self.texts.entry(i).or_insert_with(|| doc.chars(i));
+                let at = |p: Pos2| {
+                    let q = (p - rect.min) / zoom;
+                    pdf::caret(chars, (q.x, q.y))
+                };
+                if !placing && !chars.is_empty() {
+                    if let Some(p) = resp.hover_pos() {
+                        let q = (p - rect.min) / zoom;
+                        if chars.iter().any(|c| (c.rect[0]..c.rect[2]).contains(&q.x) && (c.rect[1]..c.rect[3]).contains(&q.y)) {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+                        }
+                    }
+                    if resp.drag_started()
+                        && let Some(p) = ui.input(|i| i.pointer.press_origin())
+                    {
+                        (self.select, self.selecting, self.picked) = (Some(((i, at(p)), (i, at(p)))), true, None);
+                    }
+                    if self.selecting
+                        && let (Some(p), Some(s)) = (ui.input(|i| i.pointer.latest_pos()), self.select.as_mut())
+                        && (rect.min.y - GAP / 2.0..rect.max.y + GAP / 2.0).contains(&p.y)
+                    {
+                        s.1 = (i, at(p));
+                    }
+                }
+                if let Some((a, b)) = self.select.map(|(a, b)| (a.min(b), a.max(b)))
+                    && (a.0..=b.0).contains(&i)
+                {
+                    let from = if i == a.0 { a.1.min(chars.len()) } else { 0 };
+                    let to = if i == b.0 { b.1.min(chars.len()) } else { chars.len() };
+                    for r in pdf::line_boxes(chars.get(from..to.max(from)).unwrap_or_default()) {
+                        let area = Rect::from_min_max(rect.min + vec2(r[0], r[1]) * zoom, rect.min + vec2(r[2], r[3]) * zoom);
+                        painter.rect_filled(area, 0.0, ACCENT.gamma_multiply(0.3));
+                    }
+                    resp.context_menu(|ui| {
+                        if ui.button(format!("{} Copia", ph::COPY)).clicked() {
+                            copy = true;
+                        }
+                        if ui.button(format!("{} Evidenzia", ph::HIGHLIGHTER)).clicked() {
+                            act = Some(Act::Highlight);
+                        }
+                    });
                 }
 
                 // Oggetti posati e non ancora impressi: sopra i campi, quindi ricevono loro i clic.
@@ -1546,6 +1664,17 @@ impl App {
                     }
                 }
             }
+            // Selezionando, il puntatore vicino al bordo della vista fa scorrere le pagine.
+            if self.selecting
+                && let Some(p) = ui.input(|i| i.pointer.latest_pos())
+            {
+                let clip = ui.clip_rect();
+                let dy = (clip.min.y + 30.0 - p.y).max(0.0) - (p.y - clip.max.y + 30.0).max(0.0);
+                if dy != 0.0 {
+                    ui.scroll_with_delta(vec2(0.0, dy.clamp(-40.0, 40.0)));
+                    ui.ctx().request_repaint();
+                }
+            }
             if !ui.ctx().egui_wants_keyboard_input() {
                 let key = |k| ui.input(|i| i.key_pressed(k)) as i32 as f32;
                 let dy = key(egui::Key::ArrowUp) - key(egui::Key::ArrowDown);
@@ -1554,11 +1683,23 @@ impl App {
                 }
             }
         });
+        self.view.retain(|i, _| (seen.0.saturating_sub(2)..=seen.1.saturating_add(2)).contains(i));
+        self.forms.retain(|i, _| (seen.0..=seen.1).contains(i));
+        if self.selecting && !ui.input(|i| i.pointer.primary_down()) {
+            self.selecting = false;
+        }
+        // Le pagine della selezione restano lette, anche quelle passate senza vederle.
+        let chosen = self.select.map_or(1..=0, |(a, b)| a.0.min(b.0)..=a.0.max(b.0));
+        self.texts.retain(|i, _| (seen.0..=seen.1).contains(i) || chosen.contains(i));
+        for p in chosen {
+            self.texts.entry(p).or_insert_with(|| doc.chars(p));
+        }
+        if copy {
+            ui.ctx().copy_text(self.selected_text());
+        }
         if let Some(k) = remove {
             self.remove_item(k);
         }
-        self.view.retain(|i, _| (seen.0.saturating_sub(2)..=seen.1.saturating_add(2)).contains(i));
-        self.forms.retain(|i, _| (seen.0..=seen.1).contains(i));
 
         // Scorrendo a mano, la pagina corrente diventa quella che occupa più spazio a video.
         if !forced && out.state.offset.y != self.offset.y && most_visible.1 != self.cur {
@@ -1591,6 +1732,14 @@ impl eframe::App for App {
         if ctrl(egui::Key::S) {
             self.save(false);
         }
+        if ctrl(egui::Key::P) {
+            self.print(&ctx);
+        }
+        match self.printing.as_ref().map(|r| r.try_recv()) {
+            Some(Ok(m)) => (self.msg, self.printing) = (m, None),
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => self.printing = None,
+            _ => {}
+        }
         let step = (ctrl(egui::Key::Plus) || ctrl(egui::Key::Equals)) as i32 - ctrl(egui::Key::Minus) as i32;
         if step != 0 {
             (self.zoom, self.fit) = (self.zoom * 1.25f32.powi(step), Fit::Free);
@@ -1599,9 +1748,19 @@ impl eframe::App for App {
             if ctrl(egui::Key::Z) {
                 act = Some(Act::Undo);
             }
+            // Ctrl+C arriva come evento Copy, non come tasto.
+            if ctx.input(|i| i.events.contains(&egui::Event::Copy)) && !self.selected().is_empty() {
+                ctx.copy_text(self.selected_text());
+                self.msg = "Testo copiato".into();
+            }
             let n = self.doc.as_ref().map_or(0, Doc::len);
-            if ctrl(egui::Key::A) {
-                self.sel = (0..n).collect();
+            // Ctrl+A vale per dove si è cliccato l'ultima volta: tutto il testo, o tutte le miniature.
+            if ctrl(egui::Key::A) && n > 0 {
+                if self.on_text {
+                    self.select = Some(((0, 0), (n - 1, usize::MAX)));
+                } else {
+                    self.sel = (0..n).collect();
+                }
             }
             let key = |k| ctx.input(|i| i.key_pressed(k));
             let target = [
@@ -1614,7 +1773,7 @@ impl eframe::App for App {
                 (self.cur, self.goto, self.follow) = (page, Some(page), true);
             }
             if key(egui::Key::Escape) {
-                (self.tool, self.picked) = (None, None);
+                (self.tool, self.picked, self.select) = (None, None, None);
                 self.sel.clear();
             }
             if (key(egui::Key::Delete) || key(egui::Key::Backspace))
@@ -1631,6 +1790,7 @@ impl eframe::App for App {
         });
         egui::Panel::bottom("stato").show(ui, |ui| {
             let hint = match (&self.tool, self.picked, self.sel.len()) {
+                (None, None, _) if !self.selected().is_empty() => "Ctrl+C copia il testo selezionato, Evidenzia lo colora di giallo (anche col tasto destro)".into(),
                 (Some(_), _, _) => "Clicca sulla pagina per posare (Esc per annullare)".into(),
                 (None, Some(_), _) => "Trascina per spostare, angolo blu per ridimensionare, Canc per eliminare, doppio clic sul testo per modificarlo".into(),
                 (None, None, 0) => String::new(),

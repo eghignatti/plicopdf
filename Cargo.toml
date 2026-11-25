@@ -1,6 +1,6 @@
 [package]
 name = "plicopdf"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Lightweight PDF editor: fill forms, sign, stamp, add text, rotate, reorder, insert, extract and replace pages."
 license = "GPL-3.0-or-later"
@@ -15,6 +15,13 @@ hayro = "0.8.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 lopdf = "0.45.0"
 rfd = "0.17.2"
+
+# Stampa: API di sistema, nessuna libreria in più da distribuire.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_UI_Controls_Dialogs"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"
 
 # Il rendering PDF avviene su CPU: senza ottimizzazioni le build di sviluppo sono inutilizzabili.
 [profile.dev.package."*"]
